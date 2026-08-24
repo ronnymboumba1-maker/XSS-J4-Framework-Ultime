@@ -1,0 +1,4 @@
+# XSS FRAMEWORK ULTIME - Dépendances
+PySide6>=6.5.0
+requests>=2.31.0
+colorama>=0.4.6
