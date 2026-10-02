@@ -50,18 +50,14 @@ XSS FRAMEWORK ULTIME est un outil complet de test de sécurité XSS qui permet d
 ### 🚀 Installation
 
 ```bash
-# 1. Cloner le dépôt
-git clone https://github.com/votre-compte/xss-framework.git
-cd xss-framework
+# XSS FRAMEWORK ULTIME — PERSISTANCE EDITION v1.1
+**Auteur : Jathniel** — Labo / CTF / pentest autorisé uniquement.
 
-# 2. Créer un environnement virtuel
-python -m venv venv
-source venv/bin/activate  # Linux/WSL
-# ou
-venv\Scripts\activate     # Windows
-
-# 3. Installer les dépendances
-pip install -r requirements.txt
+## Installation (Kali WSL / Ubuntu)
+```bash
+chmod +x install.sh
+./install.sh
+./run.sh   # active le venv et lance le framework
 ```
 
 🎯 Utilisation
